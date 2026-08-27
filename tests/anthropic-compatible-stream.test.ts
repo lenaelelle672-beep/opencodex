@@ -213,6 +213,74 @@ describe("Anthropic-compatible reasoning stream termination (#312)", () => {
     });
   });
 
+  test("classifies leading literal think tags split across text deltas as reasoning", async () => {
+    const response = arbitrarilyChunkedResponse([
+      'event: message_start\ndata: {"type":"message_start","message":{}}',
+      'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"<thi"}}',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"nk>private"}}',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" thought</thi"}}',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"nk>\\n\\nvisible"}}',
+      'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}',
+      'event: message_stop\ndata: {"type":"message_stop"}',
+    ].join("\n\n"));
+
+    const events = await collectAdapterEvents(response);
+    const reasoning = events
+      .filter((event): event is Extract<AdapterEvent, { type: "reasoning_raw_delta" }> => event.type === "reasoning_raw_delta")
+      .map(event => event.text)
+      .join("");
+    const visible = events
+      .filter((event): event is Extract<AdapterEvent, { type: "text_delta" }> => event.type === "text_delta")
+      .map(event => event.text)
+      .join("");
+
+    expect(reasoning).toBe("private thought");
+    expect(visible).toBe("\n\nvisible");
+    expect(visible).not.toContain("<think>");
+    expect(events.at(-1)).toEqual({ type: "done", usage: undefined });
+  });
+
+  test("keeps literal think tags that appear after visible answer text", async () => {
+    const response = arbitrarilyChunkedResponse([
+      'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Example: <think>literal</think>"}}',
+      'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}',
+      'event: message_stop\ndata: {"type":"message_stop"}',
+    ].join("\n\n"));
+
+    const events = await collectAdapterEvents(response);
+    expect(events).toContainEqual({ type: "text_delta", text: "Example: <think>literal</think>" });
+    expect(events.some(event => event.type === "reasoning_raw_delta")).toBe(false);
+  });
+
+  test("flushes an incomplete opening-tag prefix as visible text", async () => {
+    const response = arbitrarilyChunkedResponse([
+      'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"<thin"}}',
+      'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}',
+      'event: message_stop\ndata: {"type":"message_stop"}',
+    ].join("\n\n"));
+
+    const events = await collectAdapterEvents(response);
+    expect(events).toContainEqual({ type: "text_delta", text: "<thin" });
+    expect(events.at(-1)?.type).toBe("done");
+  });
+
+  test("non-streaming literal think tags become raw reasoning before visible text", async () => {
+    const events = await createAnthropicAdapter(provider).parseResponse(new Response(JSON.stringify({
+      content: [{ type: "text", text: "<reasoning>private</reasoning>\nvisible" }],
+      usage: { input_tokens: 2, output_tokens: 3 },
+      stop_reason: "end_turn",
+    })));
+
+    expect(events).toEqual([
+      { type: "reasoning_raw_delta", text: "private" },
+      { type: "text_delta", text: "\nvisible" },
+      { type: "done", usage: { inputTokens: 2, outputTokens: 3 }, stopReason: "end_turn" },
+    ]);
+  });
+
   test("non-streaming compatible reasoning blocks map without hiding later text", async () => {
     const events = await createAnthropicAdapter(provider).parseResponse(new Response(JSON.stringify({
       content: [
