@@ -73,7 +73,10 @@ export async function planImageBridge(
   if (host === "api.openai.com") return undefined;
   const found = findXaiProvider(config);
   if (!found) return undefined;
-  const token = resolveXaiImageApiKey(found.provider);
+  // OAuth bridge arms with the Grok CLI grant: the /v1/images relay already proves the
+  // OAuth access token is accepted by api.x.ai Images, so api-key-only gating needlessly
+  // disarms the bridge for OAuth logins.
+  const token = await resolveXaiImageAuthToken(found.provider);
   if (!token) return undefined;
   // Pin the baseUrl to the registry entry, ignoring any config-level baseUrl override.
   const registryEntry = getProviderRegistryEntry("xai");
@@ -138,7 +141,10 @@ export async function planVideoBridge(
   if (host === "api.openai.com") return undefined;
   const found = findXaiProvider(config);
   if (!found) return undefined;
-  const token = resolveXaiImageApiKey(found.provider);
+  // OAuth bridge arms with the Grok CLI grant: the /v1/images relay already proves the
+  // OAuth access token is accepted by api.x.ai Images, so api-key-only gating needlessly
+  // disarms the bridge for OAuth logins.
+  const token = await resolveXaiImageAuthToken(found.provider);
   if (!token) return undefined;
   // Pin the baseUrl to the registry entry, ignoring any config-level baseUrl override.
   const registryEntry = getProviderRegistryEntry("xai");
