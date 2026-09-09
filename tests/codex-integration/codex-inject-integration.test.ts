@@ -879,6 +879,90 @@ describe("injectCodexConfig integration (Design B)", () => {
     expect(restored).toContain('model = "gpt-5.5"');
   });
 
+  test("client compaction opt-in (#3978): writes an authenticated provider table and returns to Design B", () => {
+    writeFileSync(join(codexHome, "config.toml"), 'model = "gpt-5.5"\n', "utf8");
+
+    const enabled = runInject(codexHome, ocxHome, JSON.stringify({ codexClientCompaction: true }));
+    expect(enabled.status).toBe(0);
+    expect(String(JSON.parse(enabled.stdout).message)).toContain("client-side compaction mode");
+    const providerTable = readFileSync(join(codexHome, "config.toml"), "utf8");
+    expect(providerTable).toContain('model_provider = "opencodex"');
+    expect(providerTable).toContain("[model_providers.opencodex]");
+    expect(providerTable).toContain("requires_openai_auth = true");
+    expect(providerTable).not.toContain("requires_openai_auth = false");
+    expect(providerTable).not.toContain("openai_base_url");
+
+    expect(runInject(codexHome, ocxHome).status).toBe(0);
+    const designB = readFileSync(join(codexHome, "config.toml"), "utf8");
+    expect(designB).toContain(DESIGN_B_BLOCK);
+    expect(designB).not.toContain("[model_providers.opencodex]");
+    expect(designB).not.toContain('model_provider = "opencodex"');
+  });
+
+  test("client compaction opt-in leaves pre-existing ocx1 resume history byte-for-byte unchanged", () => {
+    writeFileSync(join(codexHome, "config.toml"), 'model = "gpt-5.5"\n', "utf8");
+    const sessionsDir = join(codexHome, "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+    const rolloutPath = join(sessionsDir, "rollout-ocx1.jsonl");
+    const rollout = `${JSON.stringify({
+      type: "compacted",
+      payload: {
+        replacement_history: [{
+          type: "compaction",
+          encrypted_content: "ocx1:cG9ydGFibGUgc3VtbWFyeQ==",
+        }],
+      },
+    })}\n`;
+    writeFileSync(rolloutPath, rollout, "utf8");
+    const db = new Database(join(codexHome, "state_5.sqlite"));
+    db.run(`CREATE TABLE threads (
+      id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, model_provider TEXT NOT NULL,
+      source TEXT, first_user_message TEXT, has_user_event INTEGER
+    )`);
+    db.run("INSERT INTO threads VALUES ('thread-ocx1', ?, 'opencodex', 'cli', 'hello', 1)", rolloutPath);
+    db.close();
+
+    const enabled = runInject(codexHome, ocxHome, JSON.stringify({ codexClientCompaction: true }));
+    expect(enabled.status).toBe(0);
+    expect(String(JSON.parse(enabled.stdout).message)).toContain("originals backed up for restore");
+    expect(readFileSync(rolloutPath, "utf8")).toBe(rollout);
+    const verifier = new Database(join(codexHome, "state_5.sqlite"), { readonly: true });
+    expect(verifier.query("SELECT model_provider FROM threads WHERE id = 'thread-ocx1'").get())
+      .toEqual({ model_provider: "opencodex" });
+    verifier.close();
+  });
+
+  test("client compaction opt-in keeps existing Design B threads routed through the proxy", () => {
+    writeFileSync(join(codexHome, "config.toml"), 'model = "gpt-5.5"\n', "utf8");
+    const sessionsDir = join(codexHome, "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+    const rolloutPath = join(sessionsDir, "rollout-designb.jsonl");
+    const rollout = `${JSON.stringify({
+      type: "session_meta",
+      payload: { id: "thread-designb", model_provider: "openai" },
+    })}\n`;
+    writeFileSync(rolloutPath, rollout, "utf8");
+    const db = new Database(join(codexHome, "state_5.sqlite"));
+    db.run(`CREATE TABLE threads (
+      id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, model_provider TEXT NOT NULL,
+      source TEXT, first_user_message TEXT, has_user_event INTEGER
+    )`);
+    db.run("INSERT INTO threads VALUES ('thread-designb', ?, 'openai', 'cli', 'hello', 1)", rolloutPath);
+    db.close();
+
+    const enabled = runInject(codexHome, ocxHome, JSON.stringify({ codexClientCompaction: true }));
+    expect(enabled.status).toBe(0);
+
+    // The opt-in removes the root openai_base_url override and makes `opencodex` the default
+    // provider, so a thread left tagged `openai` would resume against OpenAI directly, outside
+    // this proxy and outside the configured routing. Forward-tagging is what keeps it routed;
+    // the backup taken here is what migrates it back when the opt-in is turned off.
+    const verifier = new Database(join(codexHome, "state_5.sqlite"), { readonly: true });
+    expect(verifier.query("SELECT model_provider FROM threads WHERE id = 'thread-designb'").get())
+      .toEqual({ model_provider: "opencodex" });
+    verifier.close();
+  });
+
   test("authless Desktop opt-in never weakens non-loopback admission", () => {
     writeFileSync(join(codexHome, "config.toml"), 'model = "gpt-5.5"\n', "utf8");
 

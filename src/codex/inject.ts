@@ -175,6 +175,8 @@ export interface CodexRoutingTarget {
    * and is never weakened by this flag.
    */
   desktopAuthless?: boolean;
+  /** Select the dedicated provider identity so Codex owns compaction locally. */
+  clientCompaction?: boolean;
 }
 
 function validateCodexRoutingTarget(target: CodexRoutingTarget): CodexRoutingTarget {
@@ -198,14 +200,19 @@ function validateCodexRoutingTarget(target: CodexRoutingTarget): CodexRoutingTar
   return { ...target, baseUrl: `${parsed.origin}/v1` };
 }
 
-/** Provider-table form is used for non-loopback admission and for the authless Desktop opt-in. */
+/** Provider-table form is used when auth, admission, or compaction policy needs a dedicated provider. */
 function usesProviderTable(target: CodexRoutingTarget): boolean {
-  return target.requiresAdmissionToken || target.desktopAuthless === true;
+  return target.requiresAdmissionToken
+    || target.desktopAuthless === true
+    || target.clientCompaction === true;
 }
 
 export function standaloneCodexRoutingTarget(
   port: number,
-  config?: Pick<OcxConfig, "hostname" | "unauthenticatedLoopbackListener" | "codexDesktopAuthless">,
+  config?: Pick<
+    OcxConfig,
+    "hostname" | "unauthenticatedLoopbackListener" | "codexDesktopAuthless" | "codexClientCompaction"
+  >,
 ): CodexRoutingTarget {
   const loopback = config?.unauthenticatedLoopbackListener;
   const effectivePort = loopback?.enabled ? loopback.port : port;
@@ -217,6 +224,9 @@ export function standaloneCodexRoutingTarget(
     tokenEnv: "OPENCODEX_API_AUTH_TOKEN",
     ...(config?.codexDesktopAuthless === true && !requiresAdmissionToken
       ? { desktopAuthless: true }
+      : {}),
+    ...(config?.codexClientCompaction === true && !requiresAdmissionToken
+      ? { clientCompaction: true }
       : {}),
   };
 }
@@ -834,7 +844,7 @@ function buildProfileFileForTarget(
   const host = new URL(origin).host;
   // Design B (loopback): the reference/fallback file documents the root override form.
   // Non-loopback keeps the legacy provider-table shape (built-in provider cannot carry
-  // the x-opencodex-api-key env header); the authless Desktop opt-in shares that shape.
+  // the x-opencodex-api-key env header); explicit Desktop policies share that shape.
   if (!usesProviderTable(target)) {
     const lines = [
       "# OpenCodex proxy fallback config (Design B)",
@@ -1015,11 +1025,11 @@ export async function injectCodexConfig(
     ? setRootModelCatalogPath(content, catalogPath)
     : stripOpencodexCatalogPath(content);
 
-  // Provider-table form: non-loopback admission (legacy) or the authless Desktop opt-in (#1107).
-  const legacyMode = usesProviderTable(routingTarget);
+  // Provider-table form: non-loopback admission or an explicit Desktop policy.
+  const providerTableMode = usesProviderTable(routingTarget);
   let keptUserBaseUrl = false;
   let keptUserRealtimeWsBaseUrl = false;
-  if (legacyMode) {
+  if (providerTableMode) {
     // Legacy (non-loopback) injection: the built-in openai provider cannot carry the
     // x-opencodex-api-key env header, so keep the opencodex provider table + root re-tag.
     // The authless opt-in needs the same table because only a dedicated provider can carry
@@ -1188,12 +1198,12 @@ export async function injectCodexConfig(
     atomicWriteFile(CODEX_PROFILE_PATH, profileContent);
     markJournalInjectedState(content, profileContent, {
       // A root override is ours only in loopback Design B when no user-owned value won.
-      injectedOpenaiBaseUrl: legacyMode || keptUserBaseUrl
+      injectedOpenaiBaseUrl: providerTableMode || keptUserBaseUrl
         ? null
         : rootTomlString(content, "openai_base_url"),
       // The sideband override is ours only when we wrote it this pass (never in legacy mode,
       // never when the user owns either key).
-      injectedRealtimeWsBaseUrl: legacyMode || keptUserBaseUrl || keptUserRealtimeWsBaseUrl
+      injectedRealtimeWsBaseUrl: providerTableMode || keptUserBaseUrl || keptUserRealtimeWsBaseUrl
         ? null
         : rootTomlString(content, REALTIME_WS_BASE_URL_KEY),
       // This is the catalog artifact selected for this injection, even when config.toml
@@ -1330,7 +1340,14 @@ export async function injectCodexConfig(
   }
   // Legacy mode still forward-tags history so re-tagged threads stay listable. Design B needs
   // the opposite: a one-time migration of previously re-tagged threads BACK to openai (restore
-  // machinery; cheap no-op when there is nothing to migrate).
+  // machinery; cheap no-op when there is nothing to migrate). The client-compaction opt-in uses
+  // a provider table too, so it forward-tags for the same reason the other table forms do: with
+  // `model_provider = "opencodex"` and no root `openai_base_url` override, a thread still tagged
+  // `openai` resolves to Codex's built-in provider and resumes straight against OpenAI, outside
+  // this proxy and outside the configured routing. Leaving those threads untagged would silently
+  // send namespaced routed models to the wrong destination. Forward-tagging is future-only in the
+  // sense that matters: it rewrites provider metadata, never an existing `ocx1:` payload, and the
+  // backup taken here is what migrates the threads back when the opt-in is turned off.
   // History runs in a Worker under H, not on this thread.
   //
   // The three surfaces it touches — the SQLite rows, the backup manifest, and the
@@ -1344,7 +1361,7 @@ export async function injectCodexConfig(
     operation: deriveCodexHistoryOperation({
       direction: "apply",
       resumeHistory: config?.syncResumeHistory !== false,
-      legacyMode,
+      legacyMode: providerTableMode,
     }),
   });
   // A blocked or failed unit is reported, not silently counted as zero work:
@@ -1378,8 +1395,8 @@ export async function injectCodexConfig(
     config?.syncResumeHistory === false
       ? `  Codex resume history: left unchanged (syncResumeHistory=false).\n`
       : history.failed
-        ? formatApplyHistoryFailure(historyOutcome, legacyMode)
-        : legacyMode
+        ? formatApplyHistoryFailure(historyOutcome, providerTableMode)
+        : providerTableMode
           ? `  Codex resume history: ${history.rows} thread(s) made visible for opencodex; originals backed up for restore.\n`
           : migratedRows > 0
             ? `  Codex resume history: restored original provider metadata for ${migratedRows} manifest-backed thread(s) (one-time).\n`
@@ -1403,7 +1420,9 @@ export async function injectCodexConfig(
   }
   const headline = routingTarget.desktopAuthless === true
     ? `Injected opencodex as default provider into Codex config (authless Desktop mode: requires_openai_auth = false).\n`
-    : legacyMode
+    : routingTarget.clientCompaction === true
+      ? `Injected opencodex as default provider into Codex config (client-side compaction mode; ChatGPT auth remains required).\n`
+    : providerTableMode
       ? `Injected opencodex as default provider into Codex config.\n`
       : `Pointed Codex's built-in openai provider at the opencodex proxy (openai_base_url + realtime sideband override).\n`;
   return {
@@ -1417,7 +1436,7 @@ export async function injectCodexConfig(
       `  All models now route through opencodex proxy (like OpenRouter).\n` +
       `  OpenAI models (gpt-5.5, etc.) are passed through to OpenAI.\n` +
       `  Custom models route to their configured providers.\n` +
-      (legacyMode
+      (providerTableMode
         ? `  Fallback: codex --profile opencodex (same behavior)`
         : `  Fallback reference: ${CODEX_PROFILE_PATH}`),
   };
