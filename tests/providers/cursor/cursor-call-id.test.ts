@@ -25,6 +25,13 @@ describe("cursor call-id codec", () => {
     expect(decodeCursorCallId("call_abc123")).toBe("call_abc123");
   });
 
+  test("missing and non-string ids do not throw on startsWith", () => {
+    for (const id of [undefined, null, 123, { x: 1 }]) {
+      expect(decodeCursorCallId(id)).toBe("");
+      expect(encodeCursorCallId(id)).toBe("");
+    }
+  });
+
   test("reserved-prefix ids are escaped and round-trip", () => {
     for (const id of ["ocxc1_", "ocxc1_Y2FsbF8x", "ocxc1_!!not-base64url!!", "ocxc1_raw\nwire"]) {
       const encoded = encodeCursorCallId(id);

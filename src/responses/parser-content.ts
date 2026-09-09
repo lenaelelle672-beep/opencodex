@@ -12,7 +12,7 @@ type InputBlock =
   | { type: "input_file"; file_id?: string; filename?: string; file_data?: string };
 
 /** A usable reference string, or undefined. Empty strings and non-strings are not references. */
-function nonEmptyString(value: unknown): string | undefined {
+export function nonEmptyString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 

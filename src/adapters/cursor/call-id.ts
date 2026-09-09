@@ -67,13 +67,23 @@ function hasValidProvenance(prefix: string, payload: string, tag: string): boole
   return timingSafeEqual(received, provenanceTag(prefix, payload));
 }
 
+/**
+ * History replay and the loose Responses catch-all can hand us a missing or
+ * non-string call id. The codec's only job then is not to throw on
+ * `id.startsWith` — return empty so pairing stays a no-op.
+ */
+function asCursorCallId(id: unknown): string {
+  return typeof id === "string" ? id : "";
+}
+
 /** Encode a Cursor wire call id into a single-line Responses-safe id. */
-export function encodeCursorCallId(id: string): string {
+export function encodeCursorCallId(id: unknown): string {
+  const value = asCursorCallId(id);
   // CR/LF content is the codec's actual job, so it wins the primary namespace.
-  if (needsEncoding(id)) return encodeWithProvenance(CALL_ID_PREFIX, id);
+  if (needsEncoding(value)) return encodeWithProvenance(CALL_ID_PREFIX, value);
   // A reserved id carries no newline; it only needs to stop looking like our output.
-  if (isReserved(id)) return encodeWithProvenance(CALL_ID_ESCAPE_PREFIX, id);
-  return id;
+  if (isReserved(value)) return encodeWithProvenance(CALL_ID_ESCAPE_PREFIX, value);
+  return value;
 }
 
 /**
@@ -82,27 +92,28 @@ export function encodeCursorCallId(id: string): string {
  * clients) pass through unchanged; a malformed encoded payload also passes
  * through rather than corrupting pairing.
  */
-export function decodeCursorCallId(id: string): string {
-  const escaped = id.startsWith(CALL_ID_ESCAPE_PREFIX);
-  if (!escaped && !id.startsWith(CALL_ID_PREFIX)) return id;
+export function decodeCursorCallId(id: unknown): string {
+  const value = asCursorCallId(id);
+  const escaped = value.startsWith(CALL_ID_ESCAPE_PREFIX);
+  if (!escaped && !value.startsWith(CALL_ID_PREFIX)) return value;
   const prefix = escaped ? CALL_ID_ESCAPE_PREFIX : CALL_ID_PREFIX;
-  const encoded = id.slice(prefix.length);
+  const encoded = value.slice(prefix.length);
   const separator = encoded.indexOf(CALL_ID_PROVENANCE_SEPARATOR);
-  if (separator <= 0 || separator !== encoded.lastIndexOf(CALL_ID_PROVENANCE_SEPARATOR)) return id;
+  if (separator <= 0 || separator !== encoded.lastIndexOf(CALL_ID_PROVENANCE_SEPARATOR)) return value;
   const payload = encoded.slice(0, separator);
   const tag = encoded.slice(separator + CALL_ID_PROVENANCE_SEPARATOR.length);
-  if (!hasValidProvenance(prefix, payload, tag)) return id;
+  if (!hasValidProvenance(prefix, payload, tag)) return value;
   try {
     const decoded = Buffer.from(payload, "base64url").toString("utf8");
     // Round-trip guard: only trust payloads our encoder could have produced.
-    if (Buffer.from(decoded, "utf8").toString("base64url") !== payload) return id;
+    if (Buffer.from(decoded, "utf8").toString("base64url") !== payload) return value;
     // Each namespace admits exactly what its encoder puts there. An `ocxc1_` payload
     // that decodes to newline-free text is NOT our output — it is an opaque upstream
     // id that merely looks like ours, and unwrapping it would change the id.
-    if (escaped ? !isReserved(decoded) : !needsEncoding(decoded)) return id;
+    if (escaped ? !isReserved(decoded) : !needsEncoding(decoded)) return value;
     return decoded;
   } catch {
-    return id;
+    return value;
   }
 }
 

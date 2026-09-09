@@ -573,6 +573,22 @@ describe("Responses parser", () => {
 describe("codex-rs compat surface (260707)", () => {
   const base = { model: "claude-sonnet-4-6", stream: true };
 
+  test("function_call history without a string call_id still parses as empty ids", () => {
+    const parsed = parseRequest({ ...base, input: [
+      { type: "message", role: "user", content: "hi" },
+      { type: "function_call", name: "Read", arguments: "{\"path\":\"/tmp/x\"}" },
+      { type: "function_call_output", output: "ok" },
+      { type: "function_call", call_id: 123, name: "Read", arguments: "{}" },
+      { type: "function_call_output", call_id: { x: 1 }, output: "ok" },
+    ]});
+    const calls = parsed.context.messages
+      .filter(m => m.role === "assistant")
+      .flatMap(m => m.content.filter(part => part.type === "toolCall"));
+    const results = parsed.context.messages.filter(m => m.role === "toolResult");
+    expect(calls.map(part => part.id)).toEqual(["", ""]);
+    expect(results.map(m => m.toolCallId)).toEqual(["", ""]);
+  });
+
   test("function_call_output arrays keep input_text blocks (FunctionCallOutputContentItem)", () => {
     const parsed = parseRequest({ ...base, input: [
       { type: "function_call", call_id: "c1", name: "view_image", arguments: "{}" },
@@ -899,12 +915,12 @@ describe("unpaired tool result boundary (#3259)", () => {
       | undefined;
 
   test("a function_call_output with no call_id still parses, and yields an unusable toolCallId", () => {
-    // This is the state src/server/responses/core.ts guards on. `toolCallId` is declared
-    // `string` (src/types/request.ts:168) but is undefined here — the schema catch-all
-    // (schema.ts:106) accepted the item and parser.ts:738 assigned it unchecked.
+    // Loose inputItemSchema still admits the item. Normalize the missing call_id to "" so
+    // Cursor's call-id codec never sees `undefined` and `startsWith` cannot throw.
+    // findToolById matches by identity, so "" still cannot pair.
     const result = toolResultOf({ type: "function_call_output", output: "bootstrap result" });
     expect(result).toBeDefined();
-    expect(typeof result?.toolCallId).not.toBe("string");
+    expect(result?.toolCallId).toBe("");
   });
 
   test("an empty-string call_id is equally unusable", () => {
@@ -919,10 +935,10 @@ describe("unpaired tool result boundary (#3259)", () => {
     expect(result).toMatchObject({ toolCallId: "call_1", content: "ok" });
   });
 
-  test("custom_tool_call_output has the identical hole (parser.ts:752)", () => {
+  test("custom_tool_call_output missing call_id also normalizes to an empty string", () => {
     const result = toolResultOf({ type: "custom_tool_call_output", output: "x" });
     expect(result).toBeDefined();
-    expect(typeof result?.toolCallId).not.toBe("string");
+    expect(result?.toolCallId).toBe("");
   });
 
   test("tolerances unrelated to call_id stay intact", () => {

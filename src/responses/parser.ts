@@ -22,7 +22,7 @@ import { extractHostedWebSearch, WEB_SEARCH_TOOL_NAME } from "../web-search/synt
 import { buildImageTool, extractHostedImageGeneration, IMAGE_GEN_TOOL_NAME } from "../images/synthetic-tool";
 import { toolSearchDescription, toolSearchParameters } from "./tool-search-compat";
 
-import { isObj, inputContentParts, outputTextOf, outputToToolResultContent, toolOutputContainsEncryptedContent } from "./parser-content";
+import { isObj, inputContentParts, nonEmptyString, outputTextOf, outputToToolResultContent, toolOutputContainsEncryptedContent } from "./parser-content";
 import { mapToolChoice, buildTools, customToolNamespaces } from "./parser-tools";
 import { parseTextFormat } from "./parser-text-format";
 import { externalTaskInputContent } from "./task-input";
@@ -321,7 +321,10 @@ export function parseRequest(
       }
 
       if (effectiveType === "function_call") {
-        const call = item as { id?: string; call_id: string; name: string; arguments?: string; namespace?: string; extra_content?: unknown };
+        const call = item as { id?: unknown; call_id?: unknown; name: string; arguments?: string; namespace?: string; extra_content?: unknown };
+        // Loose inputItemSchema can admit a function_call without a string call_id.
+        // Keep an empty id rather than handing `undefined` to Cursor's call-id codec.
+        const callId = nonEmptyString(call.call_id) ?? "";
         // Tolerate empty/non-JSON arguments (e.g. a no-arg tool call serialized as "") instead of
         // throwing — a single poisoned history item would otherwise 400 every subsequent turn.
         let args: Record<string, unknown> = {};
@@ -331,7 +334,7 @@ export function parseRequest(
             const parsed: unknown = JSON.parse(rawArgs);
             if (isObj(parsed)) args = parsed;
           } catch {
-            console.warn(`[parser] function_call ${call.call_id} has non-JSON arguments; defaulting to {}`);
+            console.warn(`[parser] function_call ${callId} has non-JSON arguments; defaulting to {}`);
           }
         }
         // Do NOT map Responses item `id` (fc_/ctc_/…) onto `thoughtSignature`. That field is
@@ -339,7 +342,7 @@ export function parseRequest(
         // thoughtSignature 400s Antigravity (Base64 / TYPE_BYTES). Continuity for CCA comes from
         // the in-process replay cache (and any already-real signature stored on the tool call).
         const toolCall: OcxToolCall = {
-          type: "toolCall", id: call.call_id, name: call.name, arguments: args,
+          type: "toolCall", id: callId, name: call.name, arguments: args,
           ...(call.namespace ? { namespace: call.namespace } : {}),
         };
         // Provider-opaque metadata (e.g. a Gemini thought signature) travels with the call so a
@@ -347,23 +350,22 @@ export function parseRequest(
         // depending on the same-process replay cache (issue #1735). Real clients do not echo
         // extra_content on replay, so fall back to the proxy-side store keyed by call_id.
         const providerMetadata = providerMetadataFromResponsesFunctionCall(call)
-          ?? (typeof call.call_id === "string"
-            ? replayThoughtSignatureMetadata(call.call_id, replayCacheScope)
-            : undefined);
+          ?? (callId ? replayThoughtSignatureMetadata(callId, replayCacheScope) : undefined);
         if (providerMetadata) toolCall.providerMetadata = providerMetadata;
         assistantHolderWithReasoning().content.push(toolCall);
         continue;
       }
 
       if (effectiveType === "custom_tool_call") {
-        const call = item as { id?: string; call_id: string; name: string; input: string };
-        const remembered = typeof call.call_id === "string" ? replayThoughtSignatureMetadata(call.call_id, replayCacheScope) : undefined;
+        const call = item as { id?: unknown; call_id?: unknown; name: string; input: string };
+        const callId = nonEmptyString(call.call_id) ?? "";
+        const remembered = callId ? replayThoughtSignatureMetadata(callId, replayCacheScope) : undefined;
         // Reconstruct the namespace the request declared this tool under. The wire item
         // carries only the bare name, so without this the round trip loses it and adapters
         // replay the call as an unnamespaced tool the provider may not expose.
         const customNamespace = customToolNamespacesByName.get(call.name);
         const toolCall: OcxToolCall = {
-          type: "toolCall", id: call.call_id, name: call.name,
+          type: "toolCall", id: callId, name: call.name,
           arguments: { input: call.input ?? "" },
           customWireName: call.name,
           ...(customNamespace ? { namespace: customNamespace } : {}),
@@ -376,8 +378,8 @@ export function parseRequest(
       if (effectiveType === "local_shell_call") {
         // codex-rs LocalShellCall replay: pair it as an assistant toolCall so the subsequent
         // function_call_output (same call_id) doesn't become an orphaned tool result.
-        const call = item as { id?: string; call_id?: string; action?: { type?: string; command?: string[] } };
-        const callId = call.call_id ?? call.id;
+        const call = item as { id?: unknown; call_id?: unknown; action?: { type?: string; command?: string[] } };
+        const callId = nonEmptyString(call.call_id) ?? nonEmptyString(call.id);
         if (callId) {
           const command = Array.isArray(call.action?.command) ? call.action.command : [];
           const remembered = replayThoughtSignatureMetadata(callId, replayCacheScope);
@@ -401,8 +403,8 @@ export function parseRequest(
       if (effectiveType === "tool_search_call") {
         // Preserve the model's prior tool_search call as an assistant tool call so multi-turn
         // history stays complete (otherwise the model re-issues tool_search forever).
-        const call = item as { id?: string; call_id?: string; arguments?: unknown };
-        const callId = call.call_id ?? call.id ?? "";
+        const call = item as { id?: unknown; call_id?: unknown; arguments?: unknown };
+        const callId = nonEmptyString(call.call_id) ?? nonEmptyString(call.id) ?? "";
         const remembered = callId ? replayThoughtSignatureMetadata(callId, replayCacheScope) : undefined;
         assistantHolderWithReasoning().content.push({
           type: "toolCall", id: callId, name: "tool_search",
@@ -432,7 +434,7 @@ export function parseRequest(
         }
         const failed = typeof out.status === "string" && out.status !== "completed" && out.status !== "success";
         messages.push({
-          role: "toolResult", toolCallId: out.call_id ?? "", toolName: "tool_search",
+          role: "toolResult", toolCallId: nonEmptyString(out.call_id) ?? "", toolName: "tool_search",
           content: failed && wireNames.length === 0
             ? `Tool search failed (status: ${out.status}).`
             : wireNames.length
@@ -449,12 +451,13 @@ export function parseRequest(
           messages.push({ role: "user", content: externalTaskInput, timestamp: now });
           continue;
         }
-        const output = item as { call_id: string; output?: string | unknown[] };
-        attachPendingReasoningToCallOwner(messages, output.call_id, pendingReasoning);
+        const output = item as { call_id?: unknown; output?: string | unknown[] };
+        const callId = nonEmptyString(output.call_id) ?? "";
+        attachPendingReasoningToCallOwner(messages, callId, pendingReasoning);
         pendingReasoning.length = 0;
-        const toolInfo = findToolById(messages, output.call_id);
+        const toolInfo = findToolById(messages, callId);
         messages.push({
-          role: "toolResult", toolCallId: output.call_id,
+          role: "toolResult", toolCallId: callId,
           toolName: toolInfo.name, toolNamespace: toolInfo.namespace,
           content: outputToToolResultContent(output.output), isError: false, timestamp: now,
           ...(toolOutputContainsEncryptedContent(output.output) ? { containsEncryptedContent: true } : {}),
@@ -463,12 +466,13 @@ export function parseRequest(
       }
 
       if (effectiveType === "custom_tool_call_output") {
-        const output = item as { call_id: string; output: string | unknown[] };
-        attachPendingReasoningToCallOwner(messages, output.call_id, pendingReasoning);
+        const output = item as { call_id?: unknown; output: string | unknown[] };
+        const callId = nonEmptyString(output.call_id) ?? "";
+        attachPendingReasoningToCallOwner(messages, callId, pendingReasoning);
         pendingReasoning.length = 0;
-        const toolInfo = findToolById(messages, output.call_id);
+        const toolInfo = findToolById(messages, callId);
         messages.push({
-          role: "toolResult", toolCallId: output.call_id,
+          role: "toolResult", toolCallId: callId,
           toolName: toolInfo.name, toolNamespace: toolInfo.namespace,
           // Same payload shape as function_call_output (codex-rs FunctionCallOutputPayload):
           // string or content items — normalize arrays instead of leaking raw wire blocks.
