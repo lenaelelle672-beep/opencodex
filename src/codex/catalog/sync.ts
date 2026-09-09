@@ -946,7 +946,9 @@ export function mergeCatalogEntriesFromObservedState({
       const preserved = normalizeServiceTiers({ ...m, priority: nativePriority(slug, m.priority) });
       // Older natives kept from disk still need the mock top tiers (max + ultra always
       // for subagent max spawns; wire-clamped to the model's real top rung).
-      if (!isGpt56NativeSlug(slug)) ensureUltraReasoningLevel(preserved);
+      // 5.6 natives are included too: a shadowed combo-alias row surviving from disk must
+      // still show the uniform ultra selector (max is their real rung, ultra is synthetic).
+      ensureUltraReasoningLevel(preserved);
       return preserved;
     })
     : [];

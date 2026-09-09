@@ -367,7 +367,7 @@ describe("combo catalog capability intersection", () => {
       const row = buildCatalogEntries(template, [], [model], undefined, false, "default", exact)
         .find(entry => entry.slug === "combo/mixed");
       expect((row?.supported_reasoning_levels as Array<{ effort: string }>).map(level => level.effort))
-        .toEqual(["low", "medium"]);
+        .toEqual(["low", "medium", "max", "ultra"]);
       expect(row?.default_reasoning_level).toBe("medium");
       expect(row?.input_modalities).toEqual(["text"]);
     }
@@ -379,7 +379,7 @@ describe("combo catalog capability intersection", () => {
     );
     const row = merged.find(entry => entry.slug === "combo/mixed");
     expect((row?.supported_reasoning_levels as Array<{ effort: string }>).map(level => level.effort))
-      .toEqual(["low", "medium"]);
+      .toEqual(["low", "medium", "max", "ultra"]);
     expect(row?.input_modalities).toEqual(["text"]);
     expect(row?.owned_by).toBe("combo");
   });
@@ -504,7 +504,7 @@ describe("combo catalog capability intersection", () => {
     const row = buildCatalogEntries(null, [], [model], undefined, false, "default", new Set([alias]))[0]!;
 
     expect((row.supported_reasoning_levels as Array<{ effort: string }>).map(level => level.effort))
-      .toEqual(["low", "medium"]);
+      .toEqual(["low", "medium", "max", "ultra"]);
     expect(row.input_modalities).toEqual(["text"]);
   });
 
