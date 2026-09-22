@@ -222,6 +222,11 @@ export const OPENAI_DAYBREAK_REASONING_EFFORTS: Record<string, string[]> = Objec
 );
 export const OPENROUTER_GPT56_MODELS = OPENAI_GPT56_MODELS.map(id => `openai/${id}`);
 export const XAI_MODELS = [
+  // 260922: grok-4.7 shipped (live /v1/models, context_length 500000,
+  // capabilities.reasoning_effort low/medium/high/xhigh, default high). Kept beside 4.6
+  // rather than replacing it — the subscription lane still serves 4.6 and the ladder differs
+  // only by the model id.
+  "grok-4.7",
   "grok-4.6",
   "grok-4.5",
   "grok-4.3",

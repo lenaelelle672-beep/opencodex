@@ -237,7 +237,11 @@ export function applyReasoningLevels(
   // routed adapters clamp via clampToSupportedCodexEffort and natives via
   // nativeEffortClamp (max -> the model's real top rung). A `none`-only ladder is NOT
   // reasoning-capable, so it must not grow synthetic top rungs.
-  if (!preserveExact && efforts.length > 0 && efforts.some(effort => effort !== "none" && effort !== "minimal")) {
+  // Codex exposes one uniform top selector across routed models. Exact combos still preserve
+  // their provider-derived lower tiers, but every reasoning-capable entry also needs the synthetic
+  // max/ultra pair so the selector is usable; the request adapter clamps those markers to the
+  // target's real highest wire value.
+  if (efforts.length > 0 && efforts.some(effort => effort !== "none" && effort !== "minimal")) {
     const additions: string[] = [];
     if (!suppressSyntheticMax && !efforts.includes("max")) additions.push("max");
     if (!efforts.includes("ultra")) additions.push("ultra");

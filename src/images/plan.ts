@@ -60,9 +60,16 @@ export async function planImageBridge(
   routedProvider: OcxProviderConfig,
 ): Promise<ImageBridgePlan | undefined> {
   if (config.images?.bridgeEnabled !== true) return undefined;
-  if (!parsed._imageGeneration) return undefined;
+  // config-driven arming: Codex attaches its hosted image_generation tool only for
+  // ChatGPT-account sessions; API-key/proxied sessions never send it, so an xAI login
+  // plus the bridge switch is sufficient evidence the caller wants image generation.
+  if (parsed._compactionRequest === true) return undefined;
+  // Non-streaming callers (self-test probes, ZCode chat) cannot run the SSE-only bridge
+  // loop; core.ts would 400 them, so arm only for streaming requests and let the rest
+  // pass through untouched.
+  if (!parsed.stream) return undefined;
   const toolAllowed = toolChoiceToolPredicate(parsed.options.toolChoice);
-  const toolNames = new Set([...parsed._imageGeneration.toolNames].filter(name => toolAllowed({ name })));
+  const toolNames = new Set([...(parsed._imageGeneration?.toolNames ?? [])].filter(name => toolAllowed({ name })));
   if (toolAllowed({ name: IMAGE_GEN_TOOL_NAME })) toolNames.add(IMAGE_GEN_TOOL_NAME);
   if (toolNames.size === 0) return undefined;
   // Responses advertises and rewrites authorized aliases to this synthetic name, so the loop
@@ -73,14 +80,17 @@ export async function planImageBridge(
   if (host === "api.openai.com") return undefined;
   const found = findXaiProvider(config);
   if (!found) return undefined;
-  const token = resolveXaiImageApiKey(found.provider);
+  // OAuth bridge arms with the Grok CLI grant: the /v1/images relay already proves the
+  // OAuth access token is accepted by api.x.ai Images, so api-key-only gating needlessly
+  // disarms the bridge for OAuth logins.
+  const token = await resolveXaiImageAuthToken(found.provider);
   if (!token) return undefined;
   // Pin the baseUrl to the registry entry, ignoring any config-level baseUrl override.
   const registryEntry = getProviderRegistryEntry("xai");
   const pinnedBaseUrl = (registryEntry?.baseUrl ?? "https://api.x.ai/v1").replace(/\/+$/, "");
   // The synthetic tool injected into the conversation is named IMAGE_GEN_TOOL_NAME,
   // which is what the model will actually call. toolNames also retains authorized hosted aliases.
-  const original = parsed._imageGeneration.originalTool;
+  const original = parsed._imageGeneration?.originalTool;
   const hostedSize = typeof original?.size === "string" ? original.size : undefined;
   const hostedQuality = typeof original?.quality === "string" ? original.quality : undefined;
   const timeoutMs = clampImageTimeoutMs(config.images?.timeoutMs);
@@ -138,7 +148,10 @@ export async function planVideoBridge(
   if (host === "api.openai.com") return undefined;
   const found = findXaiProvider(config);
   if (!found) return undefined;
-  const token = resolveXaiImageApiKey(found.provider);
+  // OAuth bridge arms with the Grok CLI grant: the /v1/images relay already proves the
+  // OAuth access token is accepted by api.x.ai Images, so api-key-only gating needlessly
+  // disarms the bridge for OAuth logins.
+  const token = await resolveXaiImageAuthToken(found.provider);
   if (!token) return undefined;
   // Pin the baseUrl to the registry entry, ignoring any config-level baseUrl override.
   const registryEntry = getProviderRegistryEntry("xai");

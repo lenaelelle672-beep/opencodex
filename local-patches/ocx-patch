@@ -1,0 +1,437 @@
+#!/bin/bash
+# ocx-patch: opencodex 本地补丁一键重打（ocx update 后运行）
+# 适配 2.41.0：P1/P2/P6/P7 已被上游吸收，仅保留以下 4 个补丁
+#   3. combos/resolve.ts      单目标 combo 失败不进冷却（防 503 黑洞）
+#   4. cursor/transport-retry Cursor 限流错误可退避重试
+#   5. effort-policy + responses/core  主对话强制抬到该模型最高推理档
+#   8. anthropic + kiro-thinking  普通文本 think 标签转为推理事件
+#  11. codex/catalog/effort    目录统一显示 max/ultra（精确 combo 豁免移除）
+#  12. lib/errors + combos/failover  智谱「使用上限」→ usage_limit_exceeded 并 hop（2.60 最小版）
+#  12. usage-limit fidelity    智谱 5h 上限原文回给 Codex，不再被 429 重试冲掉
+# 幂等：已打过的补丁自动跳过
+
+# 目标包路径：默认全局安装；OCX_PATCH_PKG 可指向源码克隆（用于把补丁提交成 commit）
+PKG="${OCX_PATCH_PKG:-$HOME/.npm-global/lib/node_modules/@bitkyc08/opencodex}"
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+ok()  { echo -e "${GREEN}✅ $1${NC}"; }
+skip(){ echo -e "${GREEN}⏭️  $1 (已打过)${NC}"; }
+info(){ echo -e "${YELLOW}$1${NC}"; }
+
+[ -d "$PKG/src" ] || { echo "❌ 找不到 opencodex: $PKG"; exit 1; }
+
+# ---------- 补丁 3: combos/resolve 单目标免冷却（2.41 锚点） ----------
+F="$PKG/src/combos/resolve.ts"
+if grep -q "Single-target combos have nothing to fail over to" "$F"; then
+  skip "补丁3 resolve（单目标免冷却）"
+else
+  cp "$F" "$F.bak"
+  python3 - "$F" << 'PYEOF'
+import sys
+f = sys.argv[1]
+s = open(f).read()
+old = '''  if (options.cooldownScope !== "none") {'''
+new = '''  // Single-target combos have nothing to fail over to; cooling the only target turns an
+  // upstream blip into a "No available targets" blackout for the caller. Let those
+  // requests pass through so the real upstream error surfaces.
+  if (options.cooldownScope !== "none" && !(combo && combo.targets.length === 1)) {'''
+assert old in s, "补丁3 锚点未找到（版本结构变了，需手动适配）"
+s = s.replace(old, new, 1)
+open(f, "w").write(s)
+PYEOF
+  [ $? -eq 0 ] && ok "补丁3 resolve（单目标免冷却）已打" || { echo "❌ 补丁3失败"; exit 1; }
+fi
+
+# ---------- 补丁 4: transport-retry 限流可重试 ----------
+F="$PKG/src/adapters/cursor/transport-retry.ts"
+if grep -q "Rate-limit rejections happen BEFORE" "$F"; then
+  skip "补丁4 transport-retry（限流可重试）"
+else
+  cp "$F" "$F.bak"
+  python3 - "$F" << 'PYEOF'
+import sys
+f = sys.argv[1]
+s = open(f).read()
+old = '''  if (/resource.exhausted|resource_exhausted|rate limit|too many requests|throttl/.test(haystack)) return false;'''
+new = '''  // Rate-limit rejections happen BEFORE the run is committed — safe to retry with backoff.
+  // (Previously non-retryable, which surfaced per-minute throttling straight to Codex.)
+  if (/resource.exhausted|resource_exhausted|rate limit|too many requests|throttl/.test(haystack)) return true;'''
+assert old in s, "补丁4 锚点未找到（版本结构变了，需手动适配）"
+s = s.replace(old, new, 1)
+open(f, "w").write(s)
+PYEOF
+  [ $? -eq 0 ] && ok "补丁4 transport-retry（限流可重试）已打" || { echo "❌ 补丁4失败"; exit 1; }
+fi
+
+# ---------- 补丁 5a: effort-policy 追加抬档函数（2.41 锚点=文件尾 applyEffortCap） ----------
+F="$PKG/src/server/effort-policy.ts"
+if grep -q "export function applyHighestReasoningEffort" "$F"; then
+  skip "补丁5 effort-policy（抬到最高档）"
+else
+  cp "$F" "$F.bak"
+  python3 - "$F" << 'PYEOF'
+import sys
+f = sys.argv[1]
+s = open(f).read()
+old = '''  if (codexEffortRank(requested) <= codexEffortRank(resolved)) return null;
+  parsed.options.reasoning = resolved;
+  if (raw?.reasoning && typeof raw.reasoning === "object") raw.reasoning.effort = resolved;
+  return { from: requested, to: resolved, subagent };
+}
+'''
+new = '''  if (codexEffortRank(requested) <= codexEffortRank(resolved)) return null;
+  parsed.options.reasoning = resolved;
+  if (raw?.reasoning && typeof raw.reasoning === "object") raw.reasoning.effort = resolved;
+  return { from: requested, to: resolved, subagent };
+}
+
+/**
+ * Raise a main-turn effort to the routed model's real top rung. Codex GUI may
+ * advertise only xhigh for prefixed models (gs-sol/...) or send a stale global
+ * `low`; adapters already clamp unknown labels, so sending the top supported
+ * rung is the quality-preserving default. Compaction and helper rewrites stay
+ * untouched — those callers force this themselves.
+ */
+export function applyHighestReasoningEffort(
+  parsed: OcxParsedRequest,
+  supported?: readonly string[] | undefined,
+): { from: string; to: string } | null {
+  if (parsed._compactionRequest === true) return null;
+
+  let highest: string | undefined;
+  if (supported === undefined) {
+    highest = "max";
+  } else {
+    const rankable = supported.filter(effort => isCodexReasoningEffort(effort) && effort !== "ultra");
+    if (rankable.length === 0) return null;
+    highest = rankable.reduce((best, rung) => (
+      codexEffortRank(rung) > codexEffortRank(best) ? rung : best
+    ));
+  }
+  if (!highest) return null;
+
+  const requested = parsed.options.reasoning;
+  if (requested === highest) return null;
+  parsed.options.reasoning = highest;
+  const raw = parsed._rawBody as { reasoning?: Record<string, unknown> } | undefined;
+  if (raw && typeof raw === "object") {
+    if (raw.reasoning && typeof raw.reasoning === "object" && !Array.isArray(raw.reasoning)) {
+      raw.reasoning.effort = highest;
+    } else {
+      raw.reasoning = { effort: highest };
+    }
+  }
+  return { from: typeof requested === "string" && requested.length > 0 ? requested : "unset", to: highest };
+}
+'''
+assert old in s, "补丁5a 锚点未找到（版本结构变了，需手动适配）"
+s = s.replace(old, new, 1)
+open(f, "w").write(s)
+PYEOF
+  [ $? -eq 0 ] && ok "补丁5 effort-policy（抬到最高档）已打" || { echo "❌ 补丁5a失败"; exit 1; }
+fi
+
+# ---------- 补丁 5b: responses/core-normalize 接入抬档（2.60 锚点=effort-cap 块后） ----------
+F="$PKG/src/server/responses/core-normalize.ts"
+if grep -q "applyHighestReasoningEffort" "$F"; then
+  skip "补丁5 core（接入抬档）"
+else
+  cp "$F" "$F.bak"
+  python3 - "$F" << 'PYEOF'
+import sys
+f = sys.argv[1]
+s = open(f).read()
+old = '''    } else if (isInjectionDebugEnabled() && (config.effortCap || config.subagentEffortCap)) {
+      injectionDebugLog(`[opencodex] ${route.modelId}: effort cap skipped (surface=${surface ?? "none"}, v2 feature only)`);
+    }
+  }
+'''
+new = '''    } else if (isInjectionDebugEnabled() && (config.effortCap || config.subagentEffortCap)) {
+      injectionDebugLog(`[opencodex] ${route.modelId}: effort cap skipped (surface=${surface ?? "none"}, v2 feature only)`);
+    }
+  }
+
+  {
+    const { applyHighestReasoningEffort, supportedLadderFor } = await import("../effort-policy");
+    if (
+      parsed._compactionRequest !== true
+      && (logCtx as unknown as Record<string, unknown>).shadowCallRewrittenFrom === undefined
+    ) {
+      const raised = applyHighestReasoningEffort(parsed, supportedLadderFor(route));
+      if (raised) {
+        logCtx.requestedEffort = `${raised.from}->${raised.to}`;
+        if (isInjectionDebugEnabled()) {
+          injectionDebugLog(`[opencodex] ${route.modelId}: effort raised to model top (${raised.from} -> ${raised.to})`);
+        }
+      }
+    }
+  }
+'''
+assert old in s, "补丁5b 锚点未找到（版本结构变了，需手动适配）"
+s = s.replace(old, new, 1)
+open(f, "w").write(s)
+PYEOF
+  [ $? -eq 0 ] && ok "补丁5 core（接入抬档）已打" || { echo "❌ 补丁5b失败"; exit 1; }
+fi
+
+# ---------- 补丁 8: Anthropic 普通文本 think 标签转为推理事件 ----------
+F="$PKG/src/adapters/anthropic.ts"
+K="$PKG/src/adapters/kiro-thinking.ts"
+if grep -q "Anthropic-compatible gateways may serialize reasoning as a leading literal tag" "$F"; then
+  skip "补丁8 anthropic（think 标签分类）"
+else
+  cp "$F" "$F.bak8"
+  cp "$K" "$K.bak8"
+  python3 "$HOME/.npm-global/lib/ocx-patch-p8.py"
+  [ $? -eq 0 ] && ok "补丁8 anthropic（think 标签分类）已打" || { echo "❌ 补丁8失败"; exit 1; }
+fi
+
+# ---------- 补丁 9: images/plan 生图/生视频桥支持 OAuth 凭证 ----------
+F="$PKG/src/images/plan.ts"
+if grep -q "OAuth bridge arms with the Grok CLI grant" "$F"; then
+  skip "补丁9 images/plan（生图桥支持OAuth）"
+else
+  cp "$F" "$F.bak9"
+  python3 - "$F" << 'PYEOF'
+import sys
+f = sys.argv[1]
+s = open(f).read()
+old = '''  const token = resolveXaiImageApiKey(found.provider);
+  if (!token) return undefined;'''
+new = '''  // OAuth bridge arms with the Grok CLI grant: the /v1/images relay already proves the
+  // OAuth access token is accepted by api.x.ai Images, so api-key-only gating needlessly
+  // disarms the bridge for OAuth logins.
+  const token = await resolveXaiImageAuthToken(found.provider);
+  if (!token) return undefined;'''
+n = s.count(old)
+assert n == 2, f"补丁9 锚点应出现2次(图片桥+视频桥)，实际{n}次"
+s = s.replace(old, new, 2)
+open(f, "w").write(s)
+PYEOF
+  [ $? -eq 0 ] && ok "补丁9 images/plan（生图桥支持OAuth）已打" || { echo "❌ 补丁9失败"; exit 1; }
+fi
+
+# ---------- 补丁 10: 生图桥不等 Codex 发工具，配置开启即武装 ----------
+F="$PKG/src/images/plan.ts"
+if grep -q "config-driven arming" "$F"; then
+  skip "补丁10 images/plan（配置驱动武装）"
+else
+  cp "$F" "$F.bak10"
+  python3 - "$F" << 'PYEOF'
+import sys
+f = sys.argv[1]
+s = open(f).read()
+old = '''  if (config.images?.bridgeEnabled !== true) return undefined;
+  if (!parsed._imageGeneration) return undefined;
+  const toolAllowed = toolChoiceToolPredicate(parsed.options.toolChoice);
+  const toolNames = new Set([...parsed._imageGeneration.toolNames].filter(name => toolAllowed({ name })));'''
+new = '''  if (config.images?.bridgeEnabled !== true) return undefined;
+  // config-driven arming: Codex attaches its hosted image_generation tool only for
+  // ChatGPT-account sessions; API-key/proxied sessions never send it, so an xAI login
+  // plus the bridge switch is sufficient evidence the caller wants image generation.
+  if (parsed._compactionRequest === true) return undefined;
+  const toolAllowed = toolChoiceToolPredicate(parsed.options.toolChoice);
+  const toolNames = new Set([...(parsed._imageGeneration?.toolNames ?? [])].filter(name => toolAllowed({ name })));'''
+assert old in s, "补丁10 锚点1未找到（版本结构变了，需手动适配）"
+s = s.replace(old, new, 1)
+old2 = '''  const original = parsed._imageGeneration.originalTool;'''
+new2 = '''  const original = parsed._imageGeneration?.originalTool;'''
+assert old2 in s, "补丁10 锚点2未找到"
+s = s.replace(old2, new2, 1)
+old3 = '''  if (parsed._compactionRequest === true) return undefined;
+  const toolAllowed = toolChoiceToolPredicate(parsed.options.toolChoice);'''
+new3 = '''  if (parsed._compactionRequest === true) return undefined;
+  // Non-streaming callers (self-test probes, ZCode chat) cannot run the SSE-only bridge
+  // loop; core.ts would 400 them, so arm only for streaming requests and let the rest
+  // pass through untouched.
+  if (!parsed.stream) return undefined;
+  const toolAllowed = toolChoiceToolPredicate(parsed.options.toolChoice);'''
+assert old3 in s, "补丁10 锚点3未找到"
+s = s.replace(old3, new3, 1)
+open(f, "w").write(s)
+PYEOF
+  [ $? -eq 0 ] && ok "补丁10 images/plan（配置驱动武装）已打" || { echo "❌ 补丁10失败"; exit 1; }
+fi
+
+# ---------- 补丁 11: 目录统一显示 max/ultra（精确 combo 不再豁免；2.60 移除保留行分支） ----------
+F="$PKG/src/codex/catalog/effort.ts"
+if grep -q "Codex exposes one uniform top selector" "$F"; then
+  skip "补丁11 catalog（统一显示 ultra）"
+else
+  cp "$F" "$F.bak11"
+  python3 - "$F" << 'PYEOF'
+import sys
+f = sys.argv[1]
+s = open(f).read()
+old = '''  if (!preserveExact && efforts.length > 0 && efforts.some(effort => effort !== "none" && effort !== "minimal")) {'''
+new = '''  // Codex exposes one uniform top selector across routed models. Exact combos still preserve
+  // their provider-derived lower tiers, but every reasoning-capable entry also needs the synthetic
+  // max/ultra pair so the selector is usable; the request adapter clamps those markers to the
+  // target's real highest wire value.
+  if (efforts.length > 0 && efforts.some(effort => effort !== "none" && effort !== "minimal")) {'''
+assert old in s, "补丁11 锚点未找到（版本结构变了，需手动适配）"
+s = s.replace(old, new, 1)
+open(f, "w").write(s)
+PYEOF
+  [ $? -eq 0 ] && ok "补丁11 catalog（统一显示 ultra）已打" || { echo "❌ 补丁11失败"; exit 1; }
+fi
+
+# ---------- 补丁 12: 智谱/计划额度上限原文回给 Codex（2.60 最小侵入版） ----------
+F="$PKG/src/lib/errors.ts"
+G="$PKG/src/combos/failover.ts"
+if grep -q "使用上限" "$F" && grep -q "USAGE_LIMIT_ERROR_CODE" "$G"; then
+  skip "补丁12 usage-limit（限额识别+hop）"
+else
+  cp "$F" "$F.bak12"; cp "$G" "$G.bak12"
+  python3 - "$F" << 'PYEOF'
+import sys
+f = sys.argv[1]
+s = open(f).read()
+# 1) 常量 + 识别函数，插在 classifyError 定义前
+anchor1 = '''export function classifyError(status: number, type: string, message: string): OcxErrorPayload {'''
+addition = '''export const USAGE_LIMIT_ERROR_CODE = "usage_limit_exceeded";
+
+/** Hard plan/quota windows (Zhipu 5h cap, Codex usage-limit UI), not per-minute throttling. */
+export function isPlanUsageCapMessage(message: string): boolean {
+  if (message.includes("使用上限")) return true;
+  const lower = message.toLowerCase();
+  return (
+    lower.includes("usage_limit_exceeded")
+    || lower.includes("hit your usage limit")
+    || lower.includes("hourly usage limit")
+    || /\\b5\\s*-?\\s*hours? usage (?:limit|cap)\\b/.test(lower)
+  );
+}
+
+'''
+assert anchor1 in s, "补丁12 锚点1未找到"
+s = s.replace(anchor1, addition + anchor1, 1)
+# 2) classifyError 里加分支（cursor rate limit 分支后）
+anchor2 = '''  if (text.includes("cursor rate limit exceeded")) {
+    return { message, type: "rate_limit_error", code: "rate_limit_exceeded" };
+  }
+'''
+inject2 = anchor2 + '''  if (isPlanUsageCapMessage(message) || type === USAGE_LIMIT_ERROR_CODE) {
+    return { message, type: USAGE_LIMIT_ERROR_CODE, code: USAGE_LIMIT_ERROR_CODE };
+  }
+'''
+assert anchor2 in s, "补丁12 锚点2未找到"
+s = s.replace(anchor2, inject2, 1)
+open(f, "w").write(s)
+PYEOF
+  [ $? -eq 0 ] || { echo "❌ 补丁12 errors.ts 失败"; exit 1; }
+  python3 - "$G" << 'PYEOF'
+import sys
+f = sys.argv[1]
+s = open(f).read()
+# import 补 USAGE_LIMIT_ERROR_CODE
+old_i = '''import { classifyError, isCyberPolicyCode } from "../lib/errors";'''
+new_i = '''import { classifyError, isCyberPolicyCode, USAGE_LIMIT_ERROR_CODE } from "../lib/errors";'''
+assert old_i in s, "补丁12 锚点3未找到"
+s = s.replace(old_i, new_i, 1)
+# hop 列表加 usage_limit_exceeded
+old_l = '''    "insufficient_quota",
+    "payment_required",
+    "billing_error",'''
+new_l = '''    "insufficient_quota",
+    USAGE_LIMIT_ERROR_CODE,
+    "payment_required",
+    "billing_error",'''
+assert old_l in s, "补丁12 锚点4未找到"
+s = s.replace(old_l, new_l, 1)
+open(f, "w").write(s)
+PYEOF
+  [ $? -eq 0 ] && ok "补丁12 usage-limit（限额识别+hop）已打" || { echo "❌ 补丁12 failover.ts 失败"; exit 1; }
+fi
+
+# ---------- 补丁 13: xai registry 认识 grok-4.7（2.60 锚点=xai entry 内各 map 首行） ----------
+# 为什么要改源码：`ocx start` 每次都从 PROVIDER_REGISTRY 重新派生 provider 的
+# models / modelReasoningEfforts / modelContextWindows 等元数据，写进 config.json 的
+# grok-4.7 键会在下一次 start 被抹掉。抹掉之后 supportedLadderFor() 返回 undefined，
+# 补丁5 就把回合抬到 max，而 xAI 的 grok-4.7 只认 low/medium/high/xhigh（max 报
+# 400 "Invalid reasoning effort."）。所以 grok-4.7 的能力必须落在 registry 里。
+F="$PKG/src/providers/registry/entries-core.ts"
+if grep -q '"grok-4.7"' "$F"; then
+  skip "补丁13 xai registry（grok-4.7 能力）"
+else
+  cp "$F" "$F.bak13"
+  python3 - "$F" << 'PYEOF'
+import sys
+f = sys.argv[1]
+s = open(f).read()
+pairs = [
+  # service tier：2026-09-22 实测 grok-4.7 + service_tier:"priority" 回 service_tier=priority
+  ('''    modelSupportsServiceTier: {
+      "grok-4.6": true,''',
+   '''    modelSupportsServiceTier: {
+      "grok-4.7": true,
+      "grok-4.6": true,'''),
+  # Responses wire：与 4.6 同形，oauth + responses 入站走原生 wire
+  ('''    modelWireDefaults: {
+      "grok-4.6": {''',
+   '''    modelWireDefaults: {
+      "grok-4.7": {
+        wire: "openai-responses",
+        inbound: ["responses"],
+        authModes: ["oauth"],
+      },
+      "grok-4.6": {'''),
+  # 视觉：实测 grok-4.7 接受 input_image（与 4.x 系一致）
+  ('''    modelInputModalities: {
+      "grok-4.6": ["text", "image"],''',
+   '''    modelInputModalities: {
+      "grok-4.7": ["text", "image"],
+      "grok-4.6": ["text", "image"],'''),
+  # 多轮 prompt cache：保留 reasoning_content 回放
+  ('''    preserveReasoningContentModels: ["grok-4.6", "grok-4.5", "grok-4.3", "grok-4.20-0309-reasoning"],''',
+   '''    preserveReasoningContentModels: ["grok-4.7", "grok-4.6", "grok-4.5", "grok-4.3", "grok-4.20-0309-reasoning"],'''),
+  # 推理档：live /v1/models 对 grok-4.7 报 ["low","medium","high","xhigh"]（无 none、无 max）
+  ('''    modelReasoningEfforts: {
+      "grok-4.6": ["low", "medium", "high", "xhigh"],''',
+   '''    modelReasoningEfforts: {
+      "grok-4.7": ["low", "medium", "high", "xhigh"],
+      "grok-4.6": ["low", "medium", "high", "xhigh"],'''),
+  ('''    modelDefaultReasoningEfforts: { "grok-4.6": "high" },''',
+   '''    modelDefaultReasoningEfforts: { "grok-4.7": "high", "grok-4.6": "high" },'''),
+  # 上下文窗口：live 元数据 500k（长上下文档位阈值 200k 与 4.6 相同）
+  ('''    modelContextWindows: {
+      "grok-4.6": 500_000,''',
+   '''    modelContextWindows: {
+      "grok-4.7": 500_000,
+      "grok-4.6": 500_000,'''),
+]
+for old, new in pairs:
+    assert old in s, f"补丁13 锚点未找到: {old.splitlines()[0]!r}"
+    s = s.replace(old, new, 1)
+open(f, "w").write(s)
+PYEOF
+  [ $? -eq 0 ] && ok "补丁13 xai registry（grok-4.7 能力）已打" || { echo "❌ 补丁13失败"; exit 1; }
+fi
+
+# ---------- 补丁 13b: XAI_MODELS 收录 grok-4.7（同一原因：models 也被 ocx start 重派生） ----------
+F="$PKG/src/providers/registry/model-seeds.ts"
+if grep -q '"grok-4.7"' "$F"; then
+  skip "补丁13b XAI_MODELS（收录 grok-4.7）"
+else
+  cp "$F" "$F.bak13b"
+  python3 - "$F" << 'PYEOF'
+import sys
+f = sys.argv[1]
+s = open(f).read()
+old = '''export const XAI_MODELS = [
+  "grok-4.6",'''
+new = '''export const XAI_MODELS = [
+  // 260922: grok-4.7 shipped (live /v1/models, context_length 500000,
+  // capabilities.reasoning_effort low/medium/high/xhigh, default high). Kept beside 4.6
+  // rather than replacing it — the subscription lane still serves 4.6 and the ladder differs
+  // only by the model id.
+  "grok-4.7",
+  "grok-4.6",'''
+assert old in s, "补丁13b 锚点未找到"
+s = s.replace(old, new, 1)
+open(f, "w").write(s)
+PYEOF
+  [ $? -eq 0 ] && ok "补丁13b XAI_MODELS（收录 grok-4.7）已打" || { echo "❌ 补丁13b失败"; exit 1; }
+fi
+
+echo ""
+info "全部补丁就绪。运行 ocxup 重启代理生效。"

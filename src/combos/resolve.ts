@@ -347,7 +347,10 @@ export function advanceComboAfterFailure(
   const combo = getCombo(config, pick.comboId);
   // "none" records no cooldown at all: the failure described the request, not the target, so
   // the target must stay immediately selectable for the next (differently shaped) request.
-  if (options.cooldownScope !== "none") {
+  // Single-target combos have nothing to fail over to; cooling the only target turns an
+  // upstream blip into a "No available targets" blackout for the caller. Let those
+  // requests pass through so the real upstream error surfaces.
+  if (options.cooldownScope !== "none" && !(combo && combo.targets.length === 1)) {
     const cooldownTargets = options.cooldownScope === "provider" && combo
       ? combo.targets.filter(target => target.provider === pick.target.provider)
       : [pick.target];

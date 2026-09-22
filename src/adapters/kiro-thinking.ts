@@ -4,6 +4,10 @@ import type { TranslatorBudget } from "../lib/translator-budget";
 type ThinkingTag = "<thinking>" | "<think>" | "<reasoning>";
 type ParserState = "pre" | "thinking" | "streaming";
 
+export type ThinkingParserOptions = {
+  preserveWhitespaceAfterClose?: boolean;
+};
+
 const OPEN_TAGS: ThinkingTag[] = ["<thinking>", "<think>", "<reasoning>"];
 const MAX_OPEN_TAG = Math.max(...OPEN_TAGS.map(t => t.length));
 const MAX_CLOSE_TAG = Math.max(...OPEN_TAGS.map(t => `</${t.slice(1)}`.length));
@@ -22,7 +26,10 @@ export class KiroThinkingParser {
   private thinkingBuffer = "";
   private closeTag = "";
 
-  constructor(private readonly budget?: TranslatorBudget) {}
+  constructor(
+    private readonly budget?: TranslatorBudget,
+    private readonly options: ThinkingParserOptions = {},
+  ) {}
 
   private replaceCarry(field: "preBuffer" | "thinkingBuffer", next: string): void {
     const previous = this[field];
@@ -88,7 +95,8 @@ export class KiroThinkingParser {
     const idx = this.thinkingBuffer.indexOf(close);
     if (idx >= 0) {
       const thinking = this.thinkingBuffer.slice(0, idx);
-      const after = this.thinkingBuffer.slice(idx + close.length).trimStart();
+      const remainder = this.thinkingBuffer.slice(idx + close.length);
+      const after = this.options.preserveWhitespaceAfterClose ? remainder : remainder.trimStart();
       this.replaceCarry("thinkingBuffer", "");
       this.state = "streaming";
       const events: AdapterEvent[] = [];

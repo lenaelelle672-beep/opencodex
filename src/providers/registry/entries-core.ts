@@ -198,6 +198,7 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     // the field but answers service_tier "default" — a live downgrade, not a fast tier.
     // Unlisted and future-discovered ids stay unclassified.
     modelSupportsServiceTier: {
+      "grok-4.7": true,
       "grok-4.6": true,
       "grok-4.5": true,
       "grok-4.3": true,
@@ -260,6 +261,11 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     // path. Multi-agent keeps its pin: probed 2026-09-13, the gateway downgrades its tier to
     // "default", so forwarding a caller tier would advertise a tier it does not get.
     modelWireDefaults: {
+      "grok-4.7": {
+        wire: "openai-responses",
+        inbound: ["responses"],
+        authModes: ["oauth"],
+      },
       "grok-4.6": {
         wire: "openai-responses",
         inbound: ["responses"],
@@ -302,6 +308,7 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     // the app blocks attachments client-side. grok-build-0.1 / grok-composer-2.5-fast stay out
     // (they are already listed in noVisionModels below).
     modelInputModalities: {
+      "grok-4.7": ["text", "image"],
       "grok-4.6": ["text", "image"],
       "grok-4.5": ["text", "image"],
       "grok-4.3": ["text", "image"],
@@ -314,18 +321,20 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     // reasoning_content as the top cause of prompt-cache misses on multi-turn conversations
     // (docs.x.ai prompt-caching/multi-turn, verified 2026-07-13 — devlog/_plan/260713_grok_caching).
     // Models that never emit reasoning simply have no thinking parts to replay (no-op).
-    preserveReasoningContentModels: ["grok-4.6", "grok-4.5", "grok-4.3", "grok-4.20-0309-reasoning"],
+    preserveReasoningContentModels: ["grok-4.7", "grok-4.6", "grok-4.5", "grok-4.3", "grok-4.20-0309-reasoning"],
     // grok-4.5 reasoning is always-on with low/medium/high (no off tier, no xhigh).
     // grok-4.6 adds xhigh per docs.x.ai/developers/model-capabilities/text/reasoning;
     // multi-agent accepts the same four wire values to select 4 or 16 collaborators. xAI
     // documents high as the 4.6 default but no multi-agent default, so do not invent one.
     modelReasoningEfforts: {
+      "grok-4.7": ["low", "medium", "high", "xhigh"],
       "grok-4.6": ["low", "medium", "high", "xhigh"],
       "grok-4.5": ["low", "medium", "high"],
       "grok-4.20-multi-agent-0309": ["low", "medium", "high", "xhigh"],
     },
-    modelDefaultReasoningEfforts: { "grok-4.6": "high" },
+    modelDefaultReasoningEfforts: { "grok-4.7": "high", "grok-4.6": "high" },
     modelContextWindows: {
+      "grok-4.7": 500_000,
       "grok-4.6": 500_000,
       "grok-4.5": 500_000,
       "grok-4.3": 1_000_000,

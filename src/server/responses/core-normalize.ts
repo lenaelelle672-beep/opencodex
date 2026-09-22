@@ -285,6 +285,22 @@ export async function applyFinalRouteRequestNormalization(args: {
   }
 
   {
+    const { applyHighestReasoningEffort, supportedLadderFor } = await import("../effort-policy");
+    if (
+      parsed._compactionRequest !== true
+      && (logCtx as unknown as Record<string, unknown>).shadowCallRewrittenFrom === undefined
+    ) {
+      const raised = applyHighestReasoningEffort(parsed, supportedLadderFor(route));
+      if (raised) {
+        logCtx.requestedEffort = `${raised.from}->${raised.to}`;
+        if (isInjectionDebugEnabled()) {
+          injectionDebugLog(`[opencodex] ${route.modelId}: effort raised to model top (${raised.from} -> ${raised.to})`);
+        }
+      }
+    }
+  }
+
+  {
     const { nativeEffortClamp, shouldApplyNativeEffortClamp } = await import("../../codex/catalog");
     const clamped = shouldApplyNativeEffortClamp(route.providerName, route.provider, finalSelectedModelId)
       ? nativeEffortClamp(route.modelId, parsed.options.reasoning)

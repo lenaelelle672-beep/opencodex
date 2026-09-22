@@ -266,6 +266,20 @@ export function isUpstreamResetReplayRefusedMessage(text: string): boolean {
   return text.toLowerCase().includes("connection closed before a response was received");
 }
 
+export const USAGE_LIMIT_ERROR_CODE = "usage_limit_exceeded";
+
+/** Hard plan/quota windows (Zhipu 5h cap, Codex usage-limit UI), not per-minute throttling. */
+export function isPlanUsageCapMessage(message: string): boolean {
+  if (message.includes("使用上限")) return true;
+  const lower = message.toLowerCase();
+  return (
+    lower.includes("usage_limit_exceeded")
+    || lower.includes("hit your usage limit")
+    || lower.includes("hourly usage limit")
+    || /\b5\s*-?\s*hours? usage (?:limit|cap)\b/.test(lower)
+  );
+}
+
 export function classifyError(status: number, type: string, message: string): OcxErrorPayload {
   const text = message.toLowerCase();
   if (type === "previous_response_not_found") {
@@ -332,6 +346,9 @@ export function classifyError(status: number, type: string, message: string): Oc
   // branch below and break the planned retry-with-backoff contract (WP3 review blocker 1).
   if (text.includes("cursor rate limit exceeded")) {
     return { message, type: "rate_limit_error", code: "rate_limit_exceeded" };
+  }
+  if (isPlanUsageCapMessage(message) || type === USAGE_LIMIT_ERROR_CODE) {
+    return { message, type: USAGE_LIMIT_ERROR_CODE, code: USAGE_LIMIT_ERROR_CODE };
   }
   if (
     text.includes("insufficient_quota") ||
