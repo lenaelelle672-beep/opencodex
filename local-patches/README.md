@@ -57,3 +57,18 @@ bun run scripts/test.ts tests/providers/kiro/kiro-stream.test.ts \
 # 纯净 2.60.0：650 pass / 0 fail
 # 打补丁后：622 pass / 28 fail（全部为上述三类预期失败）
 ```
+
+## 已推送到 fork 的分支
+
+云端仓库是 fork `lenaelelle672-beep/opencodex`（**不是**上游 `lidge-jun/opencodex`）。
+本补丁集已随源码克隆提交并推送：
+
+| 分支 | 内容 |
+|---|---|
+| `local/260-patchset` | **本补丁集**，基于上游 tag `v2.60.0` 的完整源码 + 10 个补丁 |
+| `upgrade-2.41` | 2.41 期的补丁 8/9/10/11（历史参考：`7bee16067`、`ce8dda9e6`、`8610340b8`、`95afc514d`） |
+| `fix/cursor-call-id-nonstring` | Cursor Responses 回放容忍缺失/非字符串 call_id |
+| `fix/codex-usage-limit-fidelity` | 计划额度上限原文回给 Codex（2.48 期） |
+
+> `fork/main` 停留在 2.48.0 那条线（含上面两个 `fix/*`），与上游 2.60.0 没有共同祖先，
+> 所以本补丁集单独走 `local/260-patchset`，没有合进 `main`。
