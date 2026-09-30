@@ -359,7 +359,6 @@ describe("kiro adapter — parseStream", () => {
       (tool: { toolSpecification: { name: string } }) => tool.toolSpecification.name,
     )).toEqual(["bash", KIRO_COMPLETION_TOOL_NAME]);
     expect(events.filter(event => event.type === "text_delta")).toEqual([
-      { type: "text_delta", text: "I am checking.", phase: "commentary" },
       { type: "text_delta", text: "Final from fallback.", phase: "final_answer" },
     ]);
     expect(events.at(-1)).toMatchObject({
@@ -617,8 +616,6 @@ describe("kiro adapter — parseStream", () => {
 
     expect(fetches).toBe(1);
     expect(events.filter(event => event.type === "text_delta")).toEqual([
-      { type: "text_delta", text: "The file has ", phase: "commentary" },
-      { type: "text_delta", text: "three lines.", phase: "commentary" },
       { type: "text_delta", text: "The file has three lines.", phase: "final_answer" },
     ]);
     expect(events.at(-1)).toMatchObject({ type: "done", endTurn: true });
@@ -689,7 +686,6 @@ describe("kiro adapter — parseStream", () => {
     ))));
 
     expect(events.filter(event => event.type === "text_delta")).toEqual([
-      { type: "text_delta", text: "Done.", phase: "commentary" },
       { type: "text_delta", text: "Done.", phase: "final_answer" },
     ]);
     expect(fetches).toBe(1);
@@ -1548,6 +1544,38 @@ describe("kiro adapter — parseStream", () => {
     expect(contextTotalTokens).toBeGreaterThan(19);
   });
 
+  test("unreported cache counters stay unknown instead of being recorded as measured zeros", async () => {
+    const adapter = createKiroAdapter(provider);
+    await adapter.buildRequest(parsedWith([{ role: "user", content: "x".repeat(700) }]));
+    const done = await doneUsage(
+      adapter,
+      eventFrame({ content: "answer" }),
+      eventFrame({
+        tokenUsage: {
+          uncachedInputTokens: 10,
+          outputTokens: 4,
+          totalTokens: 14,
+        },
+      }, "metadataEvent"),
+    );
+    // Kiro said nothing about caching on this turn. Storing 0 would make that indistinguishable
+    // from a measured total miss, which is the difference between routing that preserved a
+    // prompt cache and routing that destroyed it (#4546).
+    expect("cachedInputTokens" in done).toBe(false);
+    expect("cacheReadInputTokens" in done).toBe(false);
+    expect("cacheCreationInputTokens" in done).toBe(false);
+    expect(done.inputTokens).toBe(10);
+  });
+
+  test("a malformed cache counter is still a malformed event", async () => {
+    expect(() => parseKiroEvent(
+      "metadataEvent",
+      new TextEncoder().encode(JSON.stringify({
+        tokenUsage: { uncachedInputTokens: 10, cacheReadInputTokens: -1, outputTokens: 4, totalTokens: 14 },
+      })),
+    )).toThrow();
+  });
+
   test("authoritative turn usage floors a smaller payload context estimate", async () => {
     const adapter = createKiroAdapter(provider);
     await adapter.buildRequest(parsedWith([{ role: "user", content: "hi" }]));
@@ -2199,8 +2227,8 @@ describe("kiro adapter — non-streaming parseResponse", () => {
 
 describe("surrogate safety at kiro boundaries", () => {
   test("the reasoning carry never emits a delta ending on a lone high surrogate", async () => {
-    const { KiroThinkingParser } = await import("../../../src/adapters/kiro-thinking");
-    const parser = new KiroThinkingParser();
+    const { InlineThinkTagParser } = await import("../../../src/adapters/inline-think-tags");
+    const parser = new InlineThinkTagParser();
     // An astral char exactly at the carry/send boundary.
     const events = parser.feed("<thinking>🎆aaaaaaaaaaa");
     const emitted = JSON.stringify(events);

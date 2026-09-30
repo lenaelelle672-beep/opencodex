@@ -1,4 +1,5 @@
 import type { OcxProviderConfig } from "../types";
+import { sidecarThinkingOff } from "../adapters/anthropic-model-contract";
 import { CLAUDE_CODE_HEADERS, claudeCodeSessionId } from "../adapters/client-fingerprint";
 import { signalWithTimeout, cancelBodyOnAbort } from "../lib/abort";
 import { sidecarEnter } from "../lib/sidecar-tracker";
@@ -181,7 +182,7 @@ export async function describeImageAnthropic(
   const body = {
     model: settings.model,
     max_tokens: ANTHROPIC_VISION_MAX_TOKENS,
-    thinking: { type: "disabled" },
+    ...sidecarThinkingOff(settings.model),
     system: [
       { type: "text", text: CLAUDE_CODE_SYSTEM_INSTRUCTION },
       { type: "text", text: DESCRIBE_INSTRUCTION },
@@ -200,11 +201,12 @@ export async function describeImageAnthropic(
     const res = await fetchWithResetRetry(
       recovery => fetch(`${base}/v1/messages`, applyUpstreamRecoveryInit({
         method: "POST",
+        redirect: "manual",
         headers,
         body: JSON.stringify(body),
         signal: linkedSignal.signal,
       }, recovery)),
-      { abortSignal: linkedSignal.signal, label: "vision-sidecar-anthropic" },
+      { replaySafe: true, abortSignal: linkedSignal.signal, label: "vision-sidecar-anthropic" },
     );
     if (!res.ok) {
       // The body is untrusted and only feeds one auth-failure message, so read a bounded prefix.

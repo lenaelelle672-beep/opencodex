@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import {
@@ -9,6 +9,12 @@ import {
   TEST_RUN_LOCK_PATH_ENV,
   TEST_RUN_LOCK_TOKEN_ENV,
 } from "./test-run-lock";
+import {
+  createContainedTestTemp,
+  recoverStaleTestTempArtifactsOnce,
+  removeTestTempTree,
+  writeTestTempOwner,
+} from "./test-temp";
 
 export interface IsolatedTestEnvironment {
   root: string;
@@ -16,12 +22,35 @@ export interface IsolatedTestEnvironment {
   cleanup(): void;
 }
 
+/**
+ * Credentials of the developer's own OpenCodex install that the sandbox must not inherit. A
+ * Windows install stores its data-plane token as a user environment variable, so every shell on
+ * that machine carries it; a test that then builds a service definition or starts a proxy reads
+ * the live token instead of its fixture and fails only on a developer machine.
+ */
+export const LIVE_INSTALL_CREDENTIAL_ENV = [
+  "OPENCODEX_API_AUTH_TOKEN",
+  "OPENCODEX_ADMIN_AUTH_TOKEN",
+  "OCX_API_TOKEN_FILE",
+] as const;
+
 export function createIsolatedTestEnvironment(
   baseEnv: Record<string, string | undefined> = process.env,
 ): IsolatedTestEnvironment {
-  const root = mkdtempSync(join(tmpdir(), "opencodex-test-"));
+  const hostTemp = tmpdir();
+  const recovery = recoverStaleTestTempArtifactsOnce({ tempRoot: hostTemp });
+  if (recovery && (recovery.removed > 0 || recovery.errors > 0 || recovery.truncated)) {
+    console.warn(
+      `[test] stale TEMP recovery removed ${recovery.removed} OpenCodex test root(s)`
+      + (recovery.errors > 0 ? `; ${recovery.errors} could not be reclaimed` : "")
+      + (recovery.truncated ? "; the bounded scan will continue on a later run" : "")
+      + ".",
+    );
+  }
+  const root = mkdtempSync(join(hostTemp, "opencodex-test-"));
   const opencodexHome = join(root, ".opencodex");
   const codexHome = join(root, ".codex");
+  const containedTemp = createContainedTestTemp(root);
   mkdirSync(opencodexHome, { recursive: true });
   mkdirSync(codexHome, { recursive: true });
   if (process.platform === "win32") {
@@ -35,11 +64,14 @@ export function createIsolatedTestEnvironment(
     mkdirSync(join(root, "AppData", "Local"), { recursive: true });
     mkdirSync(join(root, "AppData", "Roaming"), { recursive: true });
   }
+  writeTestTempOwner(root, baseEnv[TEST_RUN_ID_ENV]);
+  const inherited = { ...baseEnv };
+  for (const name of LIVE_INSTALL_CREDENTIAL_ENV) delete inherited[name];
 
   return {
     root,
     env: {
-      ...baseEnv,
+      ...inherited,
       // Captured BEFORE HOME is overwritten: once the child starts with a rewritten
       // HOME, `homedir()` returns the sandbox, so this hand-off is the only way the
       // real-home write guard can still know which path to protect.
@@ -60,9 +92,12 @@ export function createIsolatedTestEnvironment(
       USERPROFILE: root,
       OPENCODEX_HOME: opencodexHome,
       CODEX_HOME: codexHome,
+      TEMP: containedTemp,
+      TMP: containedTemp,
+      TMPDIR: containedTemp,
     },
     cleanup() {
-      rmSync(root, { recursive: true, force: true });
+      removeTestTempTree(root);
     },
   };
 }
@@ -330,7 +365,38 @@ export const SERIAL_FULL_SUITE_FILES = [
   "codex-integration/issue-452-empty-503.test.ts",
   "adapters/openai/openai-provider-option-e2e.test.ts",
   "ci-workflows/release-helper.test.ts",
+  // The full macOS isolate pool stalled in the structure gate's synchronous Git
+  // child after earlier files; fresh-process execution retains the same assertions.
+  "ci-workflows/structure-ssot.test.ts",
+  // Synchronous injection subprocesses can wedge the long-lived macOS isolate
+  // parent while reaping a history Worker; contain them in a fresh bounded lane.
+  "codex-integration/codex-inject-write-lock.test.ts",
+  // Its management API import stalled the long-lived macOS isolate pool before
+  // any case ran; the complete file finishes in under a second in a fresh process.
+  "routing/subagent-roster-retention.test.ts",
+  // Linux run 36610213506 stalled this file after its WebSocket admission case
+  // in a multi-file process; all 11 cases completed in the attribution process.
+  // Keep its real listener lifecycle in a fresh process on every platform.
+  "codex-integration/active-registry-admission.test.ts",
   "update/update-stop-first.test.ts",
+  // Relays a 50 MiB WebSocket frame end to end against a 15s deadline, so its result is a
+  // measurement of the whole process, not of the relay. On a healthy 3-CPU macOS runner the
+  // echo leg alone spends 7.4s of that budget; whichever half of `--shard=N/2` it lands in
+  // decides whether it finishes. It has been passing by accident: it sat in the lighter half
+  // until three unrelated test files were added elsewhere in the tree, Bun repartitioned, and
+  // it went from 7.4s to over 15s twice in a row without anything on the sideband path
+  // changing. Quarantining it here is what keeps it a test of the relay instead of a test of
+  // its neighbours.
+  "server/server-live.test.ts",
+  // These exercise the default-home service authority, shared by parallel Bun workers.
+  // A fresh process/home prevents another file's authority from becoming this fixture's input.
+  "service/service-ownership-state.test.ts",
+  "service/service-sqlite-home.test.ts",
+  "service/service.test.ts",
+  "service/service-claim.test.ts",
+  "service/service-wsl-home-ownership.test.ts",
+  "codex-integration/native-codex-toggle.test.ts",
+  "codex-integration/native-grok-toggle.test.ts",
 ] as const;
 
 type SerialLaneBasename = (typeof SERIAL_FULL_SUITE_FILES)[number] extends infer P
@@ -358,9 +424,18 @@ function canUseSerialLanes(requested: string[]): boolean {
 }
 
 /** Build the default full-suite plan: one bounded main lane plus isolated risky files. */
-export function resolveBunTestPlan(requested: string[], comparisonCommit?: string): BunTestLane[] {
+export function resolveBunTestPlan(
+  requested: string[], comparisonCommit?: string,
+  env: Record<string, string | undefined> = process.env,
+): BunTestLane[] {
+  const rawTimeout = env.OCX_TEST_MAIN_TIMEOUT_MS;
+  const mainTimeout = rawTimeout === undefined ? 900_000 : Number(rawTimeout);
+  if (rawTimeout !== undefined && (!/^\d+$/.test(rawTimeout)
+    || !Number.isSafeInteger(mainTimeout) || mainTimeout < 60_000 || mainTimeout > 3_600_000)) {
+    throw new Error("OCX_TEST_MAIN_TIMEOUT_MS must be an integer between 60000 and 3600000");
+  }
   if (!canUseSerialLanes(requested)) {
-    return [{ label: "suite", args: resolveBunTestArgs(requested, comparisonCommit), timeoutMs: 15 * 60 * 1000 }];
+    return [{ label: "suite", args: resolveBunTestArgs(requested, comparisonCommit), timeoutMs: mainTimeout }];
   }
 
   const mainArgs = resolveBunTestArgs(requested, comparisonCommit);
@@ -369,7 +444,7 @@ export function resolveBunTestPlan(requested: string[], comparisonCommit?: strin
   mainArgs.splice(rootIndex === -1 ? mainArgs.length : rootIndex, 0, ...ignores);
   const serialRequested = withoutParallelOverride(requested);
   return [
-    { label: "parallel suite", args: mainArgs, timeoutMs: 15 * 60 * 1000 },
+    { label: "parallel suite", args: mainArgs, timeoutMs: mainTimeout },
     ...SERIAL_FULL_SUITE_FILES.map(file => ({
       label: basename(file),
       args: resolveBunTestArgs(["--parallel=1", ...serialRequested, `./tests/${file}`]),
@@ -527,7 +602,11 @@ export async function runTestLane(
   } finally {
     process.off("SIGINT", onInterrupt);
     process.off("SIGTERM", onTerminate);
-    isolated.cleanup();
+    try {
+      isolated.cleanup();
+    } catch {
+      console.error("[test] deferred cleanup of one test root after Windows kept a handle open; a later run will retry it.");
+    }
   }
 }
 

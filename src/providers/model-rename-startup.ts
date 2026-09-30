@@ -1,6 +1,30 @@
 import { mutatePersistedConfig } from "../config";
 import { projectModelRenames } from "./model-rename-migration";
+import { projectStaleContextWindows } from "./stale-context-window-migration";
+import { projectStaleModelRosters } from "./stale-model-roster-migration";
+import { projectStaleVisionClassifications } from "./stale-vision-classification-migration";
+import { projectDevinCliAuthMode } from "./devin-cli-authmode-migration";
 import type { OcxConfig } from "../types";
+
+/**
+ * The startup projection: registry model renames, then the context-window, vision-classification
+ * and model-roster repairs. Each fixes a saved row the registry can no longer reach on its own —
+ * `enrichProviderFromRegistry` backfills a missing field and never rewrites a
+ * present one — so they share this pass rather than adding a second boot step
+ * with its own persistence, adopt, and failure handling.
+ */
+export function projectStartupConfigRepairs(config: OcxConfig): ReturnType<typeof projectModelRenames> {
+  const renames = projectModelRenames(config);
+  const windows = projectStaleContextWindows(renames.config);
+  const vision = projectStaleVisionClassifications(windows.config);
+  const rosters = projectStaleModelRosters(vision.config);
+  const devinCli = projectDevinCliAuthMode(rosters.config);
+  return {
+    config: devinCli.config,
+    changed: renames.changed || windows.changed || vision.changed || rosters.changed || devinCli.changed,
+    warnings: [...renames.warnings, ...windows.warnings, ...vision.warnings, ...rosters.warnings, ...devinCli.warnings],
+  };
+}
 
 export interface ModelRenameStartupDeps {
   project: typeof projectModelRenames;
@@ -59,7 +83,7 @@ function adoptConfig(target: OcxConfig, source: OcxConfig): void {
  */
 export function runModelRenameStartupMigration(
   config: OcxConfig,
-  deps: ModelRenameStartupDeps = { project: projectModelRenames },
+  deps: ModelRenameStartupDeps = { project: projectStartupConfigRepairs },
 ): OcxConfig {
   const projection = deps.project(structuredClone(config));
   if (!projection.changed) {

@@ -1,6 +1,9 @@
+import { parseQuotaFailureCode } from "../../../src/providers/quota-types";
 import { useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject } from "react";
 import type { AccountLoadState, AccountQuotaReading } from "../components/provider-workspace/types";
 import { createBoundedFetch } from "../bounded-fetch";
+import { confirmAction, requestTextValue } from "../action-dialogs";
+import { credentialAliasRejection, CREDENTIAL_ALIAS_MAX_LENGTH } from "../credential-alias";
 import { accountNeedsReauth } from "../oauth-health-display";
 import { oauthAccountDisplayLabel } from "../provider-workspace/auth";
 
@@ -17,6 +20,12 @@ export interface OAuthAccount extends AccountQuotaReading {
   email?: string;
   active: boolean;
   needsReauth?: boolean;
+  autoSelectable?: boolean;
+  skipReason?: "needs_reauth" | "paused" | "suspended" | "cooldown" | "quota_exhausted";
+  paused?: boolean;
+  autoSwitchThresholdOverride?: number | null;
+  autoSwitchThreshold?: number;
+  effectiveAutoSwitchThreshold?: number;
   expiresAt?: number;
   health?: { status: "healthy" | "cooldown" | "reauth_required" | "warning"; reason?: string; until?: string };
   healthLabel?: string;
@@ -36,7 +45,9 @@ function mergeRosterRows<T extends QuotaRow>(rows: T[], previous: T[]): T[] {
   return mergeQuotaRows(rows, previous, false).map(row => supportsQuotaRead(row) ? {
     ...row,
     quotaPending: prior.get(row.id)?.quotaPending ?? false,
-    quotaUnavailable: prior.get(row.id)?.quotaUnavailable ?? false,
+    quotaUnavailable: prior.get(row.id)?.quotaMode === row.quotaMode ? prior.get(row.id)?.quotaUnavailable ?? false : false,
+    quotaFailure: row.quotaMode === "probe" && prior.get(row.id)?.quotaMode === row.quotaMode && prior.get(row.id)?.quotaUnavailable
+      ? parseQuotaFailureCode(prior.get(row.id)?.quotaFailure) : undefined,
   } : row);
 }
 
@@ -47,7 +58,7 @@ function mergeLateQuotaRows<T extends QuotaRow>(rows: T[], enriched: T[]): T[] {
     const incoming = byId.get(row.id);
     if (!incoming || incoming.quotaMode !== row.quotaMode) return row;
     const quota = mergeQuotaRows([incoming], [row], true)[0];
-    return { ...row, quota: quota.quota, quotaPending: quota.quotaPending, quotaUnavailable: quota.quotaUnavailable };
+    return { ...row, quota: quota.quota, quotaPending: quota.quotaPending, quotaUnavailable: quota.quotaUnavailable, quotaFailure: quota.quotaFailure };
   });
 }
 
@@ -60,7 +71,7 @@ function mergeQuotaRows<T extends QuotaRow>(rows: T[], previous: T[], enriched: 
     const supported = supportsQuotaRead(row);
     // Legacy/unknown mode must not acquire synthetic flags that would override
     // a provider report or imply that a quota probe is supported.
-    if (!supported && row.quotaMode !== "unsupported") return { ...row, quotaMode: undefined, quotaPending: undefined };
+    if (!supported && row.quotaMode !== "unsupported") return { ...row, quotaMode: undefined, quotaPending: undefined, quotaFailure: undefined };
     // Only surviving credential IDs can retain omitted data. Explicit null is an
     // authoritative invalidation, including failed/expired credential readings.
     const retain = supported && (!enriched || row.quotaUnavailable === true);
@@ -69,6 +80,8 @@ function mergeQuotaRows<T extends QuotaRow>(rows: T[], previous: T[], enriched: 
       quota: row.quotaMode === "unsupported" ? null : row.quota !== undefined ? row.quota : retain ? prior.get(row.id)?.quota : undefined,
       quotaPending: !enriched && row.quotaMode === "probe",
       quotaUnavailable: enriched ? row.quotaUnavailable === true : false,
+      quotaFailure: enriched && row.quotaMode === "probe" && row.quotaUnavailable === true
+        ? parseQuotaFailureCode(row.quotaFailure) : undefined,
     };
   });
 }
@@ -76,7 +89,7 @@ function mergeQuotaRows<T extends QuotaRow>(rows: T[], previous: T[], enriched: 
 function unavailableQuotaRows<T extends QuotaRow>(rows: T[], attempted?: T[]): T[] {
   const attemptedModes = attempted && new Map(attempted.map(row => [row.id, row.quotaMode]));
   return rows.map(row => supportsQuotaRead(row) && (!attemptedModes || attemptedModes.get(row.id) === row.quotaMode)
-    ? { ...row, quotaUnavailable: true, quotaPending: false }
+    ? { ...row, quotaUnavailable: true, quotaPending: false, quotaFailure: undefined }
     : row);
 }
 
@@ -113,6 +126,7 @@ export function useProviderAccountPools(deps: {
   const [accountSets, setAccountSets] = useState<Record<string, { activeAccountId: string | null; accounts: OAuthAccount[] }>>({});
   const [accountLoadStates, setAccountLoadStates] = useState<Record<string, AccountLoadState>>({});
   const [switchingAccount, setSwitchingAccount] = useState<{ provider: string; accountId: string } | null>(null);
+  const [pausingAccount, setPausingAccount] = useState<{ provider: string; accountId: string; paused: boolean } | null>(null);
   const [openAccounts, setOpenAccounts] = useState<Record<string, boolean>>({});
   const [keyPools, setKeyPools] = useState<Record<string, ApiKeyEntry[]>>({});
   const [addingKeyFor, setAddingKeyFor] = useState<string | null>(null);
@@ -122,6 +136,7 @@ export function useProviderAccountPools(deps: {
   const quotaGenerationRef = useRef<Record<string, number>>({});
   const selectionMutationsRef = useRef(new Map<string, symbol>());
   const requestsRef = useRef(new Set<AbortController>());
+  const pausingAccountRef = useRef<{ provider: string; accountId: string } | null>(null);
   const mountedRef = useRef(true);
   const serverRef = useRef(apiBase);
   useEffect(() => {
@@ -136,6 +151,7 @@ export function useProviderAccountPools(deps: {
     if (serverChanged) void Promise.resolve().then(() => {
       if (!mountedRef.current || serverRef.current !== apiBase) return;
       setAccountSets({});
+      setPausingAccount(null);
       setKeyPools({});
       setAccountLoadStates({});
     });
@@ -145,6 +161,7 @@ export function useProviderAccountPools(deps: {
       for (const key of Object.keys(rosterGenerations)) rosterGenerations[key] += 1;
       for (const key of Object.keys(quotaGenerations)) quotaGenerations[key] += 1;
       mutations.clear();
+      pausingAccountRef.current = null;
       for (const controller of requests) controller.abort();
       requests.clear();
     };
@@ -348,8 +365,28 @@ export function useProviderAccountPools(deps: {
     return key;
   };
 
+  const setAccountPoolThreshold = async (provider: string, threshold: number): Promise<boolean> => {
+    if (!aliveRef.current || !mountedRef.current || serverRef.current !== apiBase) return false;
+    // Pool settings and roster reads describe one server value. Invalidate older reads before
+    // publishing the confirmed save, then refresh so a concurrent external write can still win.
+    invalidateSelectionReads(provider, "oauth");
+    setAccountSets(current => {
+      const existing = current[provider];
+      return !existing ? current : { ...current, [provider]: { ...existing,
+        accounts: existing.accounts.map(row => ({ ...row,
+          autoSwitchThreshold: threshold,
+          effectiveAutoSwitchThreshold: typeof row.autoSwitchThresholdOverride === "number"
+            ? row.autoSwitchThresholdOverride : threshold,
+        })) } };
+    });
+    // Restart the full roster path, not only the cheap membership read. The settings card can
+    // resolve before the initial account load; cancelling that load without replacing its quota
+    // enrichment would leave usage bars empty until a manual refresh or remount.
+    return fetchAccountSets([provider]);
+  };
+
   const switchAccount = async (provider: string, account: OAuthAccount) => {
-    if (account.active || account.needsReauth || switchingAccountRef.current) return;
+    if (account.active || account.needsReauth || account.paused || switchingAccountRef.current || pausingAccountRef.current || selectionMutationsRef.current.has(`oauth:${provider}`)) return;
     const target = { provider, accountId: account.id };
     switchingAccountRef.current = target;
     setSwitchingAccount(target);
@@ -389,6 +426,120 @@ export function useProviderAccountPools(deps: {
     }
   };
 
+  const setAccountThreshold = async (provider: string, account: OAuthAccount, threshold: number | null): Promise<boolean> => {
+    const key = `oauth:${provider}`;
+    if (switchingAccountRef.current || pausingAccountRef.current || selectionMutationsRef.current.has(key)) return false;
+    const mutationKey = invalidateSelectionReads(provider, "oauth");
+    const mutation = Symbol();
+    selectionMutationsRef.current.set(mutationKey, mutation);
+    const currentMutation = () => aliveRef.current && mountedRef.current && serverRef.current === apiBase
+      && selectionMutationsRef.current.get(mutationKey) === mutation;
+    const label = oauthAccountDisplayLabel(accountSets[provider]?.accounts ?? [account], account, t);
+    try {
+      const bounded = createBoundedFetch(20_000);
+      requestsRef.current.add(bounded.controller);
+      let result: Pick<OAuthAccount, "autoSwitchThresholdOverride" | "autoSwitchThreshold" | "effectiveAutoSwitchThreshold">;
+      try {
+        const res = await fetch(`${apiBase}/api/oauth/accounts/auto-switch`, {
+          method: "PUT", headers: { "Content-Type": "application/json" }, signal: bounded.signal,
+          body: JSON.stringify({ provider, accountId: account.id, threshold }),
+        });
+        if (!res.ok) throw new Error("account threshold write failed");
+        result = await res.json() as typeof result;
+        if (bounded.signal.aborted) throw new Error("account threshold deadline exceeded");
+      } finally {
+        bounded.clear();
+        requestsRef.current.delete(bounded.controller);
+      }
+      const validPercent = (value: unknown) => typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 100;
+      if (!result || (result.autoSwitchThresholdOverride !== null && !validPercent(result.autoSwitchThresholdOverride))
+        || !validPercent(result.autoSwitchThreshold) || !validPercent(result.effectiveAutoSwitchThreshold)) throw new Error("invalid threshold response");
+      if (!currentMutation()) return false;
+      invalidateSelectionReads(provider, "oauth");
+      setAccountSets(current => {
+        const existing = current[provider];
+        return !existing ? current : { ...current, [provider]: { ...existing,
+          accounts: existing.accounts.map(row => row.id === account.id ? { ...row,
+            autoSwitchThresholdOverride: result.autoSwitchThresholdOverride,
+            autoSwitchThreshold: result.autoSwitchThreshold, effectiveAutoSwitchThreshold: result.effectiveAutoSwitchThreshold } : row) } };
+      });
+      return true;
+    } catch {
+      if (currentMutation()) notify(t("accountPool.autoSwitchUpdateFailed", { email: label }), false);
+      return false;
+    } finally {
+      if (currentMutation()) {
+        invalidateSelectionReads(provider, "oauth");
+        selectionMutationsRef.current.delete(mutationKey);
+        void refreshAccountRosters({ provider, kind: "oauth" });
+      }
+    }
+  };
+
+  const pauseAccount = async (provider: string, account: OAuthAccount, paused: boolean) => {
+    if (switchingAccountRef.current || pausingAccountRef.current || selectionMutationsRef.current.has(`oauth:${provider}`)) return;
+    const target = { provider, accountId: account.id };
+    pausingAccountRef.current = target;
+    setPausingAccount({ ...target, paused });
+    const key = invalidateSelectionReads(provider, "oauth");
+    const mutation = Symbol();
+    selectionMutationsRef.current.set(key, mutation);
+    const currentMutation = () => aliveRef.current && mountedRef.current && serverRef.current === apiBase
+      && selectionMutationsRef.current.get(key) === mutation;
+    const label = oauthAccountDisplayLabel(accountSets[provider]?.accounts ?? [account], account, t);
+    let result: { activeAccountId?: string | null; activeAccountChanged?: boolean };
+    try {
+      const res = await fetch(`${apiBase}/api/oauth/accounts/pause`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider, accountId: account.id, paused }),
+      });
+      if (!currentMutation()) return;
+      if (!res.ok) {
+        notify(t(paused ? "codexAuth.pauseFailed" : "codexAuth.resumeFailed", { email: label }), false);
+        return;
+      }
+      result = await res.json().catch(() => ({})) as { activeAccountId?: string | null; activeAccountChanged?: boolean };
+      if (!currentMutation()) return;
+      invalidateSelectionReads(provider, "oauth");
+      const selected = result.activeAccountId === undefined
+        ? accountSets[provider]?.activeAccountId ?? null
+        : result.activeAccountId;
+      setAccountSets(current => {
+        const existing = current[provider];
+        if (!existing) return current;
+        const accounts = existing.accounts.map(row => row.id === account.id ? { ...row, paused } : row);
+        return { ...current, [provider]: { activeAccountId: selected, accounts: selectionRows(accounts, selected) } };
+      });
+      selectionMutationsRef.current.delete(key);
+    } catch {
+      if (currentMutation()) notify(t(paused ? "codexAuth.pauseFailed" : "codexAuth.resumeFailed", { email: label }), false);
+      return;
+    } finally {
+      // Only an unconfirmed save still holds the registered mutation here.
+      if (currentMutation()) {
+        invalidateSelectionReads(provider, "oauth");
+        selectionMutationsRef.current.delete(key);
+        void refreshAccountRosters({ provider, kind: "oauth" });
+      }
+      if (pausingAccountRef.current?.provider === target.provider && pausingAccountRef.current.accountId === target.accountId) {
+        pausingAccountRef.current = null;
+        if (aliveRef.current) setPausingAccount(null);
+      }
+    }
+    // The server persisted the change. A failed follow-up read is not a failed pause: keep
+    // the saved state visible and report only the refresh failure.
+    if (!aliveRef.current || !mountedRef.current || serverRef.current !== apiBase) return;
+    notify(t(paused ? "codexAuth.pauseSucceeded" : "codexAuth.resumeSucceeded", { email: label }), true);
+    try {
+      const refreshed = await refreshAccountRosters({ provider, kind: "oauth" });
+      if (result.activeAccountChanged) await Promise.all([fetchOauth(), fetchProviderQuotas(true)]);
+      if (!refreshed) notify(t("pws.accountsLoadFailed"), false);
+    } catch {
+      if (aliveRef.current && mountedRef.current) notify(t("pws.accountsLoadFailed"), false);
+    }
+  };
+
   const switchApiKey = async (provider: string, entry: ApiKeyEntry) => {
     if (entry.active || selectionMutationsRef.current.has(`key:${provider}`)) return;
     const key = invalidateSelectionReads(provider, "api-key");
@@ -422,7 +573,12 @@ export function useProviderAccountPools(deps: {
   };
 
   const removeApiKey = async (provider: string, entry: ApiKeyEntry) => {
-    if (!window.confirm(t("prov.keyRemoveConfirm", { key: entry.label ?? entry.masked }))) return;
+    const consented = await confirmAction({
+      message: t("prov.keyRemoveConfirm", { key: entry.label ?? entry.masked }),
+      confirmLabel: t("common.remove"),
+      tone: "danger",
+    });
+    if (!consented) return;
     const res = await fetch(`${apiBase}/api/providers/keys?name=${encodeURIComponent(provider)}&id=${encodeURIComponent(entry.id)}`, { method: "DELETE" });
     if (res.ok) {
       notify(t("prov.keyRemoved", { key: entry.label ?? entry.masked }), true);
@@ -461,7 +617,12 @@ export function useProviderAccountPools(deps: {
   };
 
   const editCredentialAlias = async (provider: string, type: "oauth" | "api-key", id: string, current?: string) => {
-    const entered = window.prompt(t("prov.aliasPrompt"), current ?? "");
+    const entered = await requestTextValue({
+      message: t("prov.aliasPrompt"),
+      initialValue: current ?? "",
+      maxLength: CREDENTIAL_ALIAS_MAX_LENGTH,
+      validate: value => credentialAliasRejection(value, t),
+    });
     if (entered === null) return;
     const alias = entered.trim();
     const response = await fetch(type === "oauth" ? `${apiBase}/api/oauth/accounts/alias` : `${apiBase}/api/providers/keys/alias`, {
@@ -480,7 +641,12 @@ export function useProviderAccountPools(deps: {
 
   const removeAccount = async (provider: string, account: OAuthAccount) => {
     const label = oauthAccountDisplayLabel(accountSets[provider]?.accounts ?? [account], account, t);
-    if (!window.confirm(t("prov.accountRemoveConfirm", { email: label }))) return;
+    const consented = await confirmAction({
+      message: t("prov.accountRemoveConfirm", { email: label }),
+      confirmLabel: t("common.remove"),
+      tone: "danger",
+    });
+    if (!consented) return;
     try {
       const res = await fetch(`${apiBase}/api/oauth/accounts?provider=${encodeURIComponent(provider)}&id=${encodeURIComponent(account.id)}`, { method: "DELETE" });
       if (!res.ok) { notify(t("prov.accountRemoveFail", { email: label }), false); return; }
@@ -528,9 +694,9 @@ export function useProviderAccountPools(deps: {
   );
 
   return {
-    accountSets, accountLoadStates, switchingAccount, openAccounts, keyPools, addingKeyFor, newKeyValue,
+    accountSets, accountLoadStates, switchingAccount, pausingAccount, openAccounts, keyPools, addingKeyFor, newKeyValue,
     setAccountSets, setAccountLoadStates, setSwitchingAccount, setOpenAccounts, setKeyPools, setAddingKeyFor, setNewKeyValue,
-    fetchAccountSets, fetchKeyPools, refreshAccountRosters, switchAccount, switchApiKey, removeApiKey, addApiKeyValue, addApiKey, editCredentialAlias, removeAccount,
+    fetchAccountSets, fetchKeyPools, refreshAccountRosters, switchAccount, pauseAccount, setAccountPoolThreshold, setAccountThreshold, switchApiKey, removeApiKey, addApiKeyValue, addApiKey, editCredentialAlias, removeAccount,
     oauthCardProviders, keyCardProviders, activeAccountNeedsReauth,
   };
 }

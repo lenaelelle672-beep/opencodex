@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createResponsesPassthroughAdapter as createResponsesPassthroughAdapterProduction } from "../../src/adapters/openai-responses";
+import { stripMuseSparkUnsupportedWebSearchFields } from "../../src/adapters/openai-responses/web-search";
 import { getProviderRegistryEntry } from "../../src/providers/registry";
 import type { OcxProviderConfig } from "../../src/types";
 import { withTestTranslatorBudget } from "../helpers/translator-budget";
@@ -33,6 +34,12 @@ const ZEN_GO_PATH_PROVIDER = {
 const META_PROVIDER = {
   ...ZEN_PROVIDER,
   baseUrl: "https://api.meta.ai/v1",
+};
+
+const META_PATH_PROVIDER = {
+  ...ZEN_PROVIDER,
+  baseUrl: "https://api.meta.ai",
+  responsesPath: "/v1/responses",
 };
 
 /** A Codex web_search declaration exactly as `hosted_spec.rs` emits it for TextAndImage. */
@@ -219,7 +226,14 @@ describe("#2617/#3378 Muse Spark web_search compatibility", () => {
     }
   });
 
-  test("direct Meta preserves its web_search fields at both tool positions", () => {
+  /**
+   * #3456 scoped the guard to OpenCode Zen/Go URLs on the assumption that
+   * `https://api.meta.ai/v1` accepted Codex's extra web_search fields. Direct
+   * Meta still 400s `tools[].search_content_types` on ordinary `web_search`
+   * (live 2026-09-07 against muse-spark-1.3-contributor). Same model-id set,
+   * same field drop, same preview preservation.
+   */
+  test("direct Meta strips rejected web_search fields at both tool positions", () => {
     const body = buildForProvider(META_PROVIDER, "muse-spark-1.3-contributor", {
       tools: [webSearchTool()],
       input: [{ type: "additional_tools", tools: [webSearchTool()] }],
@@ -228,8 +242,59 @@ describe("#2617/#3378 Muse Spark web_search compatibility", () => {
     const item = (body.input as Array<Record<string, unknown>>)[0]!;
     const nested = (item.tools as Array<Record<string, unknown>>)[0]!;
     for (const declaration of [tool, nested]) {
-      expect(declaration.search_content_types).toEqual(["text", "image"]);
-      expect(declaration.indexed_web_access).toBe(true);
+      expect(declaration.type).toBe("web_search");
+      expect(declaration.search_context_size).toBe("medium");
+      expect(Object.hasOwn(declaration, "search_content_types")).toBe(false);
+      expect(Object.hasOwn(declaration, "indexed_web_access")).toBe(false);
     }
+  });
+
+  test("direct Meta keeps the field on web_search_preview", () => {
+    const body = buildForProvider(META_PROVIDER, "muse-spark-1.3-contributor", {
+      tools: [{ ...webSearchTool(), type: "web_search_preview" }],
+    });
+    const tool = toolsOf(body)[0]!;
+    expect(tool.type).toBe("web_search_preview");
+    expect(tool.search_content_types).toEqual(["text", "image"]);
+    expect(tool.indexed_web_access).toBe(true);
+  });
+
+  test("split Meta baseUrl and responsesPath derives the same strict destination", () => {
+    const body = buildForProvider(META_PATH_PROVIDER, "muse-spark-1.3-contributor", {
+      tools: [webSearchTool()],
+    });
+    const tool = toolsOf(body)[0]!;
+    expect(Object.hasOwn(tool, "search_content_types")).toBe(false);
+    expect(Object.hasOwn(tool, "indexed_web_access")).toBe(false);
+  });
+
+  /**
+   * Both direct-Meta providers ship a non-Contributor `defaultModel`, and Meta's refusal is a
+   * gateway schema rule that holds for every Muse model it serves. Keying the strip on the
+   * Contributor-only id list left `muse-spark-1.3` 400ing on every Codex turn whose client
+   * attaches its default web_search tool — the same equality-shaped hole the 1.3 id hit on the
+   * Zen wire, one tier over.
+   */
+  test("direct Meta strips the fields on the non-Contributor tiers too", () => {
+    for (const modelId of ["muse-spark-1.3", "muse-spark-1.2"]) {
+      const body = buildForProvider(META_PROVIDER, modelId, {
+        tools: [webSearchTool(), { ...webSearchTool(), type: "web_search_preview" }],
+      });
+      const [plain, preview] = toolsOf(body);
+      expect(Object.hasOwn(plain!, "search_content_types")).toBe(false);
+      expect(Object.hasOwn(plain!, "indexed_web_access")).toBe(false);
+      // The destination is the predicate here, not the id: it must not swallow the preview shape.
+      expect(preview!.search_content_types).toEqual(["text", "image"]);
+      expect(preview!.indexed_web_access).toBe(true);
+    }
+  });
+
+  test("direct Meta remains destination-scoped when the model id is unavailable", () => {
+    const body = { tools: [webSearchTool()] };
+    const rewritten = stripMuseSparkUnsupportedWebSearchFields(body, undefined, "https://api.meta.ai/v1/responses") as {
+      tools: Array<Record<string, unknown>>;
+    };
+    expect(Object.hasOwn(rewritten.tools[0]!, "search_content_types")).toBe(false);
+    expect(Object.hasOwn(rewritten.tools[0]!, "indexed_web_access")).toBe(false);
   });
 });

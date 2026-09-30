@@ -1,10 +1,14 @@
+// Holds INV-RESTORE-01 from structure/overview.md; keep the id here if this file is split or renamed.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { restoreCodexCatalog } from "../../src/codex/catalog";
+import { resolveCodexCatalogSerializationDatabasePath, resolveEffectiveUserIdentity } from "../../src/codex/user-identity";
+import { flushWindowsSecretAclReapsBeforeRemoval } from "../../src/lib/windows-secret-acl";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 
 const repoRoot = dirname(fileURLToPath(new URL("../../package.json", import.meta.url)));
@@ -28,18 +32,42 @@ function runScript(codexHome: string, opencodexHome: string, script: string): { 
 describe("Codex catalog restore", () => {
   let codexHome: string;
   let opencodexHome: string;
+  let previousCodexHome: string | undefined;
+  let previousOpencodexHome: string | undefined;
+  let catalogDatabasePath: string;
 
   beforeEach(() => {
+    previousCodexHome = process.env.CODEX_HOME;
+    previousOpencodexHome = process.env.OPENCODEX_HOME;
     codexHome = mkdtempSync(join(tmpdir(), "ocx-catalog-home-"));
     opencodexHome = mkdtempSync(join(tmpdir(), "ocx-catalog-ocx-"));
+    process.env.CODEX_HOME = codexHome;
+    process.env.OPENCODEX_HOME = opencodexHome;
+    // Cold Windows namespace discovery has two bounded 30s PowerShell lookups.
+    // Leave 5s for filesystem work beyond the two lookup envelopes.
+    catalogDatabasePath = resolveCodexCatalogSerializationDatabasePath(
+      resolveEffectiveUserIdentity(), realpathSync.native(codexHome),
+    );
+  }, 65_000);
+
+  afterEach(async () => {
+    try {
+      await flushWindowsSecretAclReapsBeforeRemoval(codexHome);
+      await flushWindowsSecretAclReapsBeforeRemoval(opencodexHome);
+      for (const suffix of ["", "-journal", "-wal", "-shm"]) {
+        rmSync(`${catalogDatabasePath}${suffix}`, { force: true });
+      }
+      if (existsSync(codexHome)) removeTreeWithRetry(codexHome);
+      if (existsSync(opencodexHome)) removeTreeWithRetry(opencodexHome);
+    } finally {
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+      if (previousOpencodexHome === undefined) delete process.env.OPENCODEX_HOME;
+      else process.env.OPENCODEX_HOME = previousOpencodexHome;
+    }
   });
 
-  afterEach(() => {
-    if (existsSync(codexHome)) removeTreeWithRetry(codexHome);
-    if (existsSync(opencodexHome)) removeTreeWithRetry(opencodexHome);
-  });
-
-  test("version-1 process journals restore, while matching client ownership is durable", () => {
+  test("version-1 process journals with injected hashes restore, while matching client ownership is durable", () => {
     const configPath = join(codexHome, "config.toml");
     const journalPath = join(codexHome, "opencodex-journal.json");
     const original = '# original\nmodel_provider = "openai"\n';
@@ -49,6 +77,8 @@ describe("Codex catalog restore", () => {
       version: 1,
       originalConfig: Buffer.from(original).toString("base64"),
       originalProfile: null,
+      injectedConfigHash: createHash("sha256").update(injected).digest("hex"),
+      injectedProfileHash: null,
       pid: 999_999,
       timestamp: new Date().toISOString(),
     }));
@@ -65,6 +95,8 @@ describe("Codex catalog restore", () => {
       version: 1,
       originalConfig: Buffer.from(original).toString("base64"),
       originalProfile: null,
+      injectedConfigHash: createHash("sha256").update(injected).digest("hex"),
+      injectedProfileHash: null,
       owner: { kind: "client", apiKeyId: "client-key-1" },
       pid: 999_999,
       timestamp: new Date().toISOString(),
@@ -79,42 +111,61 @@ describe("Codex catalog restore", () => {
     expect(existsSync(journalPath)).toBe(true);
   });
 
-  // spawnSync(bun --eval) under `bun test --isolate` on Windows can exceed the
-  // default 5s case budget when the runner is under load (seen at ~5.4s on GHA).
+  // Restore is a filesystem contract: reuse this process's Windows identity cache
+  // instead of cold-starting Bun, PowerShell and ACL setup for every case.
   test("drops routed entries without overwriting user-added native entries", () => {
     const catalogPath = join(codexHome, "catalog.json");
     writeFileSync(join(codexHome, "config.toml"), 'model_catalog_json = "catalog.json"\n', "utf8");
     writeFileSync(catalogPath, JSON.stringify({
       models: [
         { slug: "gpt-5.5" },
-        { slug: "opencode-go/deepseek-v4-pro" },
+        { slug: "opencode-go/deepseek-v4.1-flash" },
         { slug: "user-native" },
       ],
     }, null, 2) + "\n");
 
-    const r = runScript(codexHome, opencodexHome, `
-      const { restoreCodexCatalog } = require("./src/codex/catalog");
-      const result = restoreCodexCatalog();
-      console.log(JSON.stringify(result));
-    `);
-
-    expect(r.status).toBe(0);
-    expect(JSON.parse(r.stdout)).toMatchObject({ removed: 1, kept: 2 });
+    const result = restoreCodexCatalog();
+    expect(result).toMatchObject({ removed: 1, kept: 2 });
     const slugs = JSON.parse(readFileSync(catalogPath, "utf8")).models.map((m: { slug: string }) => m.slug);
     expect(slugs).toEqual(["gpt-5.5", "user-native"]);
+  }, { timeout: 15_000 });
+
+  test.each([false, true])("restore excludes retired native rows with backup=%s", withBackup => {
+    const catalogPath = join(codexHome, "catalog.json");
+    const backupPath = backupPathForTestCatalog(codexHome, opencodexHome, "catalog.json");
+    writeFileSync(join(codexHome, "config.toml"), 'model_catalog_json = "catalog.json"\n');
+    const native = {
+      slug: "gpt-5.5", visibility: "list", supported_in_api: true,
+      shell_type: "unified_exec", comp_hash: null, base_instructions: "You are Codex.",
+      model_messages: { instructions_template: "You are Codex." },
+      supported_reasoning_levels: [{ effort: "high", description: "High" }],
+    };
+    const retired = ["gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"];
+    const bare = [native, ...retired.map(slug => ({ ...native, slug }))];
+    const qualified = retired.map(slug => ({
+      ...native, slug: `desktop/${slug}`, opencodex_catalog_kind: "account-selector-v1",
+    }));
+    if (withBackup) writeFileSync(backupPath, JSON.stringify({ models: [...bare, ...qualified] }));
+    writeFileSync(catalogPath, JSON.stringify({ models: [
+      ...bare, { ...native, slug: "gpt-future-native" }, ...qualified,
+    ] }));
+    const result = { first: restoreCodexCatalog(), second: restoreCodexCatalog() };
+    expect(result).toMatchObject({ first: { removed: 6, kept: 2 }, second: { removed: 0, kept: 2 } });
+    const rows = JSON.parse(readFileSync(catalogPath, "utf8")).models;
+    expect(rows).toEqual([native, { ...native, slug: "gpt-future-native" }]);
   }, { timeout: 15_000 });
 
   test("fallback restore repairs only enabled natives with unanimously visible account clones", () => {
     const catalogPath = join(codexHome, "catalog.json");
     writeFileSync(join(codexHome, "config.toml"), 'model_catalog_json = "catalog.json"\n', "utf8");
     writeFileSync(join(opencodexHome, "config.json"), JSON.stringify({
-      disabledModels: ["gpt-5.4", "desktop/gpt-5.5"],
+      disabledModels: ["gpt-5.6-luna", "desktop/gpt-5.5"],
     }), "utf8");
     writeFileSync(catalogPath, JSON.stringify({
       models: [
         { slug: "gpt-5.5", visibility: "hide", priority: 7 },
-        { slug: "gpt-5.4", visibility: "hide" },
-        { slug: "gpt-5.3-codex-spark", visibility: "hide" },
+        { slug: "gpt-5.6-luna", visibility: "hide" },
+        { slug: "gpt-5.6-terra", visibility: "hide" },
         { slug: "user-native", visibility: "hide" },
         {
           slug: "team/gpt-5.5",
@@ -127,24 +178,17 @@ describe("Codex catalog restore", () => {
           opencodex_catalog_kind: "account-selector-v1",
         },
         {
-          slug: "team/gpt-5.4",
+          slug: "team/gpt-5.6-luna",
           visibility: "list",
           opencodex_catalog_kind: "account-selector-v1",
         },
-        { slug: "provider/gpt-5.3-codex-spark", visibility: "list" },
+        { slug: "provider/gpt-5.6-terra", visibility: "list" },
       ],
     }, null, 2) + "\n");
 
-    const r = runScript(codexHome, opencodexHome, `
-      const { restoreCodexCatalog } = require("./src/codex/catalog");
-      const first = restoreCodexCatalog();
-      const second = restoreCodexCatalog();
-      console.log(JSON.stringify({ first, second }));
-    `);
-
-    expect(r.status).toBe(0);
+    const result = { first: restoreCodexCatalog(), second: restoreCodexCatalog() };
     const resolvedCatalogPath = join(realpathSync.native(codexHome), "catalog.json");
-    expect(JSON.parse(r.stdout)).toEqual({
+    expect(result).toEqual({
       first: { removed: 4, kept: 4, path: resolvedCatalogPath },
       second: { removed: 0, kept: 4, path: resolvedCatalogPath },
     });
@@ -153,8 +197,8 @@ describe("Codex catalog restore", () => {
       visibility: "list",
       priority: 7,
     });
-    expect(restored.find(model => model.slug === "gpt-5.4")?.visibility).toBe("hide");
-    expect(restored.find(model => model.slug === "gpt-5.3-codex-spark")?.visibility).toBe("hide");
+    expect(restored.find(model => model.slug === "gpt-5.6-luna")?.visibility).toBe("hide");
+    expect(restored.find(model => model.slug === "gpt-5.6-terra")?.visibility).toBe("hide");
     expect(restored.find(model => model.slug === "user-native")?.visibility).toBe("hide");
     expect(restored.some(model => String(model.slug).includes("/"))).toBe(false);
   }, { timeout: 15_000 });
@@ -175,13 +219,8 @@ describe("Codex catalog restore", () => {
       ],
     }, null, 2) + "\n");
 
-    const r = runScript(codexHome, opencodexHome, `
-      const { restoreCodexCatalog } = require("./src/codex/catalog");
-      console.log(JSON.stringify(restoreCodexCatalog()));
-    `);
-
-    expect(r.status).toBe(0);
-    expect(JSON.parse(r.stdout)).toMatchObject({ removed: 1, kept: 1 });
+    const result = restoreCodexCatalog();
+    expect(result).toMatchObject({ removed: 1, kept: 1 });
     expect(JSON.parse(readFileSync(catalogPath, "utf8")).models).toEqual([
       { slug: "gpt-5.5", visibility: "hide" },
     ]);
@@ -193,15 +232,15 @@ describe("Codex catalog restore", () => {
     const backupPath = backupPathForTestCatalog(codexHome, opencodexHome, "catalog.json");
     writeFileSync(join(codexHome, "config.toml"), 'model_catalog_json = "catalog.json"\n', "utf8");
     writeFileSync(backupPath, JSON.stringify({
-      models: [{ slug: "gpt-5.4", visibility: "hide", priority: 50 }],
+      models: [{ slug: "gpt-5.6-luna", visibility: "hide", priority: 50 }],
     }, null, 2) + "\n");
     writeFileSync(catalogPath, JSON.stringify({
       models: [
-        { slug: "gpt-5.4", visibility: "hide", priority: 0 },
+        { slug: "gpt-5.6-luna", visibility: "hide", priority: 0 },
         { slug: "gpt-5.5", visibility: "hide", priority: 7 },
-        { slug: "gpt-5.3-codex-spark", visibility: "hide" },
+        { slug: "gpt-5.6-terra", visibility: "hide" },
         {
-          slug: "team/gpt-5.4",
+          slug: "team/gpt-5.6-luna",
           visibility: "list",
           opencodex_catalog_kind: "account-selector-v1",
         },
@@ -211,30 +250,25 @@ describe("Codex catalog restore", () => {
           opencodex_catalog_kind: "account-selector-v1",
         },
         {
-          slug: "team/gpt-5.3-codex-spark",
+          slug: "team/gpt-5.6-terra",
           visibility: "list",
           opencodex_catalog_kind: "account-selector-v1",
         },
         {
-          slug: "desktop/gpt-5.3-codex-spark",
+          slug: "desktop/gpt-5.6-terra",
           visibility: "hide",
           opencodex_catalog_kind: "account-selector-v1",
         },
       ],
     }, null, 2) + "\n");
 
-    const r = runScript(codexHome, opencodexHome, `
-      const { restoreCodexCatalog } = require("./src/codex/catalog");
-      console.log(JSON.stringify(restoreCodexCatalog()));
-    `);
-
-    expect(r.status).toBe(0);
-    expect(JSON.parse(r.stdout)).toMatchObject({ removed: 4, kept: 3 });
+    const result = restoreCodexCatalog();
+    expect(result).toMatchObject({ removed: 4, kept: 3 });
     const restored = JSON.parse(readFileSync(catalogPath, "utf8")).models as Array<Record<string, unknown>>;
     expect(restored).toEqual([
-      { slug: "gpt-5.4", visibility: "hide", priority: 50 },
+      { slug: "gpt-5.6-luna", visibility: "hide", priority: 50 },
       { slug: "gpt-5.5", visibility: "list", priority: 7 },
-      { slug: "gpt-5.3-codex-spark", visibility: "hide" },
+      { slug: "gpt-5.6-terra", visibility: "hide" },
     ]);
   }, { timeout: 15_000 });
 
@@ -257,14 +291,8 @@ describe("Codex catalog restore", () => {
       ],
     }, null, 2) + "\n");
 
-    const r = runScript(codexHome, opencodexHome, `
-      const { restoreCodexCatalog } = require("./src/codex/catalog");
-      const result = restoreCodexCatalog();
-      console.log(JSON.stringify(result));
-    `);
-
-    expect(r.status).toBe(0);
-    expect(JSON.parse(r.stdout)).toMatchObject({ removed: 1, kept: 3 });
+    const result = restoreCodexCatalog();
+    expect(result).toMatchObject({ removed: 1, kept: 3 });
     const restored = JSON.parse(readFileSync(catalogPath, "utf8")).models as Array<Record<string, unknown>>;
     expect(restored).toEqual([
       { slug: "gpt-5.5", priority: 50 },
@@ -287,14 +315,8 @@ describe("Codex catalog restore", () => {
       ],
     }, null, 2) + "\n");
 
-    const r = runScript(codexHome, opencodexHome, `
-      const { restoreCodexCatalog } = require("./src/codex/catalog");
-      const result = restoreCodexCatalog();
-      console.log(JSON.stringify(result));
-    `);
-
-    expect(r.status).toBe(0);
-    expect(JSON.parse(r.stdout)).toMatchObject({ removed: 1, kept: 2 });
+    const result = restoreCodexCatalog();
+    expect(result).toMatchObject({ removed: 1, kept: 2 });
     const restored = JSON.parse(readFileSync(catalogPath, "utf8")).models as Array<Record<string, unknown>>;
     expect(restored.map(m => m.slug)).toEqual(["gpt-5.5", "user-native"]);
   }, { timeout: 15_000 });
@@ -305,7 +327,7 @@ describe("Codex catalog restore", () => {
     writeFileSync(catalogPath, JSON.stringify({
       models: [
         { slug: "gpt-5.5", priority: 50, base_instructions: "native", visibility: "list" },
-        { slug: "gpt-5.4", priority: 0, base_instructions: "native", visibility: "list" },
+        { slug: "gpt-5.6-luna", priority: 0, base_instructions: "native", visibility: "list" },
       ],
     }, null, 2) + "\n");
 
@@ -328,7 +350,7 @@ describe("Codex catalog restore", () => {
     expect(JSON.parse(r.stdout)).toMatchObject({ added: 0 });
     const synced = JSON.parse(readFileSync(catalogPath, "utf8")).models as Array<Record<string, unknown>>;
     expect(synced.find(m => m.slug === "gpt-5.5")?.priority).toBe(0);
-    expect(synced.find(m => m.slug === "gpt-5.4")?.priority).toBeGreaterThan(100);
+    expect(synced.find(m => m.slug === "gpt-5.6-luna")?.priority).toBeGreaterThan(100);
   }, { timeout: 15_000 });
 
   test("sync advertises documented Codex-native additions omitted by the bundled catalog", () => {
@@ -378,7 +400,7 @@ describe("Codex catalog restore", () => {
           port: 10100,
           providers: {},
           defaultProvider: "openai",
-          subagentModels: ["gpt-5.5", "gpt-5.4", "gpt-5.3-codex-spark", "gpt-5.6-sol"],
+          subagentModels: ["gpt-5.5", "gpt-6-astra", "gpt-5.6-sol"],
         });
         console.log(JSON.stringify(result));
       })();
@@ -386,10 +408,19 @@ describe("Codex catalog restore", () => {
 
     expect(r.status).toBe(0);
     const synced = JSON.parse(readFileSync(catalogPath, "utf8")).models as Array<Record<string, unknown>>;
-    expect(synced.map(m => m.slug)).toContain("gpt-5.3-codex-spark");
+    expect(synced.map(m => m.slug)).not.toContain("gpt-5.3-codex-spark");
+    expect(synced.map(m => m.slug)).toContain("gpt-6-astra");
     expect(synced.map(m => m.slug)).toContain("gpt-5.6-sol");
     expect(synced.map(m => m.slug)).toContain("gpt-5.6-terra");
     expect(synced.map(m => m.slug)).toContain("gpt-5.6-luna");
-    expect(synced.find(m => m.slug === "gpt-5.4")?.max_context_window).toBe(1_000_000);
+    // gpt-5.4 is no longer a native catalog member, and no surviving native has a 1M window.
+    expect(synced.map(m => m.slug)).not.toContain("gpt-5.4");
+    // No long-window opt-in: sync narrows the emitted max to Astra's default window.
+    // The pinned 872k ceiling is available only when the operator enables the larger window.
+    expect(synced.find(m => m.slug === "gpt-6-astra")).toMatchObject({
+      context_window: 272_000,
+      max_context_window: 272_000,
+      auto_compact_token_limit: 244_800,
+    });
   }, { timeout: 15_000 });
 });

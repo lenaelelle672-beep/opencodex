@@ -7,7 +7,8 @@ import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { injectDeveloperMessage, multiAgentGuidanceText, sanitizeEncryptedContentInPlace } from "../../src/server/responses";
+import { injectDeveloperMessage, multiAgentGuidanceText, sanitizeEncryptedContentInPlace, stripAgentMessageCiphertextInPlace } from "../../src/server/responses";
+import { MULTI_AGENT_MODE_HINT_RECOMMENDATION } from "../../src/codex/multi-agent-mode-policy";
 import { parseRequest } from "../../src/responses/parser";
 import type { OcxParsedRequest } from "../../src/types";
 import { CODEX_ACCOUNT_BOUND_CATALOG_KIND, effectiveSubagentRoster } from "../../src/codex/catalog";
@@ -85,6 +86,14 @@ function catalogFixture(dir: string, models: CatalogFixtureModel[]): void {
 
 const V2_ON = "[features.multi_agent_v2]\nenabled = true\n";
 const V2_OFF = "[features]\nmulti_agent = true\n";
+const TRIGGER_ONLY_RECOMMENDATION = [
+  "Proactive multi-agent delegation is active.",
+  "Only the delegation trigger changes: a separate explicit request is no longer required.",
+  "All existing user, authority, task-scope, and collaboration-tool rules continue to apply.",
+  "Delegate eligible independent work when parallel execution could materially improve speed or quality.",
+  "User requests override this hint.",
+  "This mode remains active until a later multi-agent mode developer message changes it.",
+].join(" ");
 
 function parsedFixture(over: {
   reasoning?: string;
@@ -104,14 +113,14 @@ function parsedFixture(over: {
 }
 
 describe("multiAgentGuidanceText", () => {
-  test("v1 tool surface + max injects the tagged Proactive text", async () => {
+  test.each(["max", "ultra"])("v1 %s uses the trigger-only proactive recommendation", async reasoning => {
     codexHomeFixture(V2_OFF); // guidance fires regardless of v2 flag
     const text = await multiAgentGuidanceText(parsedFixture({
-      reasoning: "max",
+      reasoning,
       tools: [{ name: "spawn_agent", namespace: "agents" }, { name: "send_input", namespace: "agents" }],
     }));
-    expect(text).toContain("<multi_agent_mode>");
-    expect(text).toContain("Proactive multi-agent delegation is active");
+    expect(text).toBe(`<multi_agent_mode>${TRIGGER_ONLY_RECOMMENDATION}</multi_agent_mode>`);
+    expect(MULTI_AGENT_MODE_HINT_RECOMMENDATION.text).toBe(TRIGGER_ONLY_RECOMMENDATION);
   });
 
   test("v1 tool surface below the top tier stays silent", async () => {
@@ -956,6 +965,43 @@ describe("injectDeveloperMessage", () => {
       && (part as Record<string, unknown>).text === text;
   }).length;
 
+  test("upgrades historical v1 wording once and preserves replayed guidance", async () => {
+    codexHomeFixture(V2_OFF);
+    // Released bytes are independent of today's recommendation and remain in the conversation.
+    const legacyText = "<multi_agent_mode>Proactive multi-agent delegation is active. Any earlier instruction requiring an explicit user request before spawning sub-agents no longer applies. Delegate independent sub-tasks to sub-agents whenever parallel work would materially improve speed or quality — do not serialize work that can run concurrently. Each sub-agent runs in its own context and can use all available tools; prefer spawning specialists over doing everything yourself. This mode remains active until a later multi-agent mode developer message changes it.</multi_agent_mode>";
+    const produce = () => multiAgentGuidanceText(parsedFixture({
+      reasoning: "max", tools: [{ name: "spawn_agent", namespace: "agents" }],
+    }));
+    const text = await produce();
+    expect(text).toBe(`<multi_agent_mode>${TRIGGER_ONLY_RECOMMENDATION}</multi_agent_mode>`);
+    const history = [generatedItem(legacyText),
+      { type: "message", role: "user", content: "previous turn" },
+      { type: "message", role: "assistant", content: "done" }];
+    const firstInput = [...structuredClone(history), { type: "message", role: "user", content: "new turn" }];
+    const first = parseRequest({ model: "gpt-5.5", input: firstInput, previous_response_id: "resp_old_v1" });
+    first._replayPrefixLen = history.length;
+    first._continuationConversationMessageIndex = history.length;
+    injectDeveloperMessage(first, text!);
+    expect(firstInput.slice(0, history.length)).toEqual(history);
+    expect(firstInput.slice(history.length)).toEqual([generatedItem(text!),
+      { type: "message", role: "user", content: "new turn" }]);
+    expect(countExact(firstInput, legacyText)).toBe(1);
+    expect(countExact(firstInput, text!)).toBe(1);
+
+    const nextHistory = [...firstInput, { type: "message", role: "assistant", content: "done again" }];
+    const secondInput = [...structuredClone(nextHistory), { type: "message", role: "user", content: "next turn" }];
+    const second = parseRequest({ model: "gpt-5.5", input: secondInput, previous_response_id: "resp_new_v1" });
+    second._replayPrefixLen = nextHistory.length;
+    second._continuationConversationMessageIndex = nextHistory.length;
+    const nextText = await produce();
+    expect(nextText).toBe(text);
+    injectDeveloperMessage(second, nextText!);
+    expect(secondInput.slice(0, nextHistory.length)).toEqual(nextHistory);
+    expect(secondInput).toHaveLength(nextHistory.length + 1);
+    expect(countExact(secondInput, legacyText)).toBe(1);
+    expect(countExact(secondInput, text!)).toBe(1);
+  });
+
   test("inserts after leading developer metadata and before conversation", () => {
     const parsed = parseRequest({
       model: "gpt-5.5",
@@ -1322,16 +1368,17 @@ describe("injectDeveloperMessage", () => {
 });
 
 describe("sanitizeEncryptedContentInPlace", () => {
-  const fernetFixture = (): string => {
+  const fernetFixture = (index = 0): string => {
     const raw = Buffer.alloc(73, 0x5a);
     raw[0] = 0x80;
     raw.writeBigUInt64BE(1_720_000_000n, 1);
+    raw.writeUInt32BE(index, 25);
     const unpadded = raw.toString("base64url");
     return `${unpadded}${"=".repeat((4 - (unpadded.length % 4)) % 4)}`;
   };
 
   test("plaintext parked in encrypted slots becomes input_text; real blobs survive", () => {
-    const blob = "gAAAAAB".padEnd(120, "Qw1_-=");
+    const blob = fernetFixture();
     const input = [
       { type: "message", role: "user", content: [
         { type: "encrypted_content", encrypted_content: "[CXC-LEAF-GUARD] plain text with spaces" },
@@ -1431,6 +1478,63 @@ describe("sanitizeEncryptedContentInPlace", () => {
     expect(sanitizeEncryptedContentInPlace(input)).toBe(0);
     const parts = (input[0] as { content: Array<Record<string, unknown>> }).content;
     expect(parts[0]).toEqual({ type: "encrypted_content", encrypted_content: fernet });
+  });
+
+  test("65 valid runs omit the mixed slot without emitting a token suffix", () => {
+    const tokens = Array.from({ length: 65 }, (_, index) => fernetFixture(index));
+    const withinLimit = [{ type: "message", role: "user", content: [
+      { type: "encrypted_content", encrypted_content: `preamble.${tokens.slice(0, 64).join(".")}` },
+    ] }];
+    expect(sanitizeEncryptedContentInPlace(withinLimit)).toBe(1);
+    const withinParts = (withinLimit[0] as { content: Array<Record<string, unknown>> }).content;
+    expect(withinParts.length).toBeLessThanOrEqual(129);
+    expect(withinParts.filter(part => part.type === "encrypted_content")).toHaveLength(64);
+    const input = [{ type: "message", role: "user", content: [
+      { type: "encrypted_content", encrypted_content: `preamble.${tokens.join(".")}` },
+    ] }];
+
+    expect(sanitizeEncryptedContentInPlace(input)).toBe(1);
+    const parts = (input[0] as { content: Array<Record<string, unknown>> }).content;
+    expect(parts).toEqual([{ type: "input_text", text: "[encrypted content omitted]" }]);
+    const serialized = JSON.stringify(input);
+    for (const token of tokens) expect(serialized).not.toContain(token);
+  });
+
+  test("65 valid runs in an agent message normalize without forwarding token text", () => {
+    const tokens = Array.from({ length: 65 }, (_, index) => fernetFixture(index));
+    const input = [{ type: "agent_message", id: "a1", author: "/root", recipient: "/root/worker", content: [
+      { type: "encrypted_content", encrypted_content: `preamble.${tokens.join(".")}` },
+    ] }];
+
+    expect(sanitizeEncryptedContentInPlace(input)).toBe(1);
+    expect(input[0]).toMatchObject({ type: "message", role: "user" });
+    expect(stripAgentMessageCiphertextInPlace(input)).toBe(0);
+    const serialized = JSON.stringify(input);
+    for (const token of tokens) expect(serialized).not.toContain(token);
+  });
+
+  test("65 valid runs in a raw agent slot are omitted before lowering", () => {
+    const tokens = Array.from({ length: 65 }, (_, index) => fernetFixture(index));
+    const input = [{ type: "agent_message", content: [
+      { type: "encrypted_content", encrypted_content: `preamble.${tokens.join(".")}` },
+    ] }];
+    expect(stripAgentMessageCiphertextInPlace(input)).toBe(1);
+    expect((input[0] as { content: unknown[] }).content).toEqual([
+      { type: "input_text", text: "[encrypted content omitted]" },
+    ]);
+    for (const token of tokens) expect(JSON.stringify(input)).not.toContain(token);
+  });
+
+  test("65 valid runs in agent text are omitted before lowering", () => {
+    const tokens = Array.from({ length: 65 }, (_, index) => fernetFixture(index));
+    const input = [{ type: "agent_message", content: [
+      { type: "input_text", text: `preamble.${tokens.join(".")}` },
+    ] }];
+    expect(stripAgentMessageCiphertextInPlace(input)).toBe(1);
+    expect((input[0] as { content: unknown[] }).content).toEqual([
+      { type: "input_text", text: "[encrypted content omitted]" },
+    ]);
+    for (const token of tokens) expect(JSON.stringify(input)).not.toContain(token);
   });
 });
 

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createOpenAIChatAdapter } from "../../src/adapters/openai-chat";
-import { createTranslatorBudget } from "../../src/lib/translator-budget";
+import { releaseTranslatedEvent } from "../../src/lib/translator-budget";
+import { createTestTranslatorBudget as createTranslatorBudget } from "../helpers/translator-budget";
 import { enrichProviderFromRegistry } from "../../src/providers/derive";
 import { routeModel } from "../../src/router";
 import type { OcxConfig, OcxParsedRequest, OcxProviderConfig } from "../../src/types";
@@ -202,6 +203,125 @@ describe("MiniMax split reasoning", () => {
     expect(events).toContainEqual({ type: "text_delta", text: "answer" });
   });
 
+  test("streaming reasoning detail snapshots are bounded by the translation budget", async () => {
+    const route = minimaxRoute("MiniMax-M3");
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (let index = 0; index < 20; index++) {
+          const chunk = { choices: [{ delta: { reasoning_details: [{ id: `segment-${index}`, text: "x" }] } }] };
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+        }
+        controller.close();
+      },
+    });
+    const budget = createTranslatorBudget({ maxTurnBytes: 256 });
+    const events = [];
+
+    for await (const event of adapterFor(route.provider, route.modelId).parseStream(new Response(stream), budget)) {
+      events.push(event);
+    }
+
+    expect(events.at(-1)).toMatchObject({ type: "error", code: "translation_buffer_limit" });
+    expect(budget.snapshot().currentBytes).toBe(0);
+  });
+
+  test("rejects oversized reasoning detail ids without retaining them", async () => {
+    const route = minimaxRoute("MiniMax-M3");
+    const chunk = { choices: [{ delta: { reasoning_details: [{ id: "x".repeat(1025), text: "thinking" }] } }] };
+    const stream = new Response(`data: ${JSON.stringify(chunk)}\n\n`);
+    const budget = createTranslatorBudget();
+    const events = [];
+
+    for await (const event of adapterFor(route.provider, route.modelId).parseStream(stream, budget)) events.push(event);
+
+    expect(events).toEqual([expect.objectContaining({ type: "error", code: "translation_buffer_limit" })]);
+    expect(budget.snapshot().currentBytes).toBe(0);
+  });
+
+  test("rejects reasoning detail ids over 1024 UTF-8 bytes", async () => {
+    const route = minimaxRoute("MiniMax-M3");
+    const chunk = { choices: [{ delta: { reasoning_details: [{ id: "é".repeat(513), text: "thinking" }] } }] };
+    const stream = new Response(`data: ${JSON.stringify(chunk)}\n\n`);
+    const budget = createTranslatorBudget();
+    const events = [];
+    for await (const event of adapterFor(route.provider, route.modelId).parseStream(stream, budget)) events.push(event);
+    expect(events).toEqual([expect.objectContaining({ type: "error", code: "translation_buffer_limit" })]);
+    expect(budget.snapshot().currentBytes).toBe(0);
+  });
+
+  test("a non-streaming response with the same oversized id is still parsed", async () => {
+    const route = minimaxRoute("MiniMax-M3");
+    const budget = createTranslatorBudget();
+    const response = new Response(JSON.stringify({
+      choices: [{
+        finish_reason: "stop",
+        message: {
+          content: "final answer",
+          reasoning_details: [{ type: "reasoning.text", id: "é".repeat(513), format: "MiniMax-response-v1", index: 0, text: "full thinking" }],
+        },
+      }],
+      usage: { total_tokens: 10 },
+    }));
+
+    // parseResponse retains no snapshot key, so the key cap must not turn a
+    // valid response into a parse failure.
+    const events = await adapterFor(route.provider, route.modelId).parseResponse(response, budget);
+
+    expect(events).toContainEqual({ type: "reasoning_raw_delta", text: "full thinking" });
+    expect(events).toContainEqual({ type: "text_delta", text: "final answer" });
+    // The returned batch is caller-owned and stays charged until consumed; releasing
+    // each event's lease must drain the budget, proving no snapshot key is retained.
+    for (const event of events) releaseTranslatedEvent(event, budget);
+    expect(budget.snapshot().currentBytes).toBe(0);
+  });
+
+  test("accepts exactly 1024 distinct reasoning detail segment keys", async () => {
+    const route = minimaxRoute("MiniMax-M3");
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (let index = 0; index < 1024; index++) {
+          const chunk = { choices: [{ delta: { reasoning_details: [{ id: `segment-${index}`, text: "x" }] } }] };
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+        }
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      },
+    });
+    const budget = createTranslatorBudget();
+    const events = [];
+    for await (const event of adapterFor(route.provider, route.modelId).parseStream(new Response(stream), budget)) {
+      events.push(event);
+    }
+    expect(events.filter(e => e.type === "reasoning_raw_delta")).toHaveLength(1024);
+    expect(events.some(e => e.type === "error")).toBe(false);
+    expect(budget.snapshot().currentBytes).toBe(0);
+  });
+
+  test("rejects the 1025th distinct reasoning detail segment key", async () => {
+    const route = minimaxRoute("MiniMax-M3");
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (let index = 0; index < 1025; index++) {
+          const chunk = { choices: [{ delta: { reasoning_details: [{ id: `segment-${index}`, text: "x" }] } }] };
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+        }
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      },
+    });
+    const budget = createTranslatorBudget();
+    const events = [];
+    for await (const event of adapterFor(route.provider, route.modelId).parseStream(new Response(stream), budget)) {
+      events.push(event);
+    }
+    expect(events.filter(e => e.type === "reasoning_raw_delta")).toHaveLength(1024);
+    expect(events.at(-1)).toMatchObject({ type: "error", code: "translation_buffer_limit" });
+    expect(budget.snapshot().currentBytes).toBe(0);
+  });
+
   test("providers without reasoning_details opt-in keep ignoring the array", async () => {
     const provider: OcxProviderConfig = {
       adapter: "openai-chat",
@@ -253,5 +373,87 @@ describe("MiniMax split reasoning", () => {
     const events = await adapterFor(provider, "other-model").parseResponse(response, createTranslatorBudget());
 
     expect(events.some(e => e.type === "reasoning_raw_delta")).toBe(false);
+  });
+});
+
+describe("MiniMax-M3.1-Flash-Preview reasoning wire", () => {
+  // Probed 2026-09-30: thinking cannot be turned off (effort none or thinking disabled
+  // answers 400 code 2013), effort low..max is accepted as-is, reasoning_split is ignored
+  // and thinking always returns as reasoning_content.
+  const PREVIEW = "MiniMax-M3.1-Flash-Preview";
+
+  test("Codex efforts go out as identity reasoning_effort and never disable thinking", () => {
+    const route = minimaxRoute(PREVIEW);
+    for (const effort of ["low", "medium", "high", "xhigh", "max"] as const) {
+      const sent = body(route.provider, route.modelId, effort);
+      expect(sent).toMatchObject({ model: PREVIEW, reasoning_effort: effort });
+      expect(sent).not.toHaveProperty("thinking");
+      expect(sent).not.toHaveProperty("reasoning_split");
+    }
+    expect(body(route.provider, route.modelId, "minimal")).toMatchObject({ reasoning_effort: "low" });
+    expect(body(route.provider, route.modelId, "ultra" as ReasoningEffort)).toMatchObject({ reasoning_effort: "max" });
+    const none = body(route.provider, route.modelId, "none" as ReasoningEffort);
+    expect(none).not.toHaveProperty("reasoning_effort");
+    expect(none).not.toHaveProperty("thinking");
+  });
+
+  test("the preview advertises low..max with max as the default", () => {
+    const route = minimaxRoute(PREVIEW);
+    expect(route.provider.modelReasoningEfforts?.[PREVIEW]).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect(route.provider.modelDefaultReasoningEfforts?.[PREVIEW]).toBe("max");
+    expect(route.provider.thinkingToggleModels ?? []).not.toContain(PREVIEW);
+    expect(route.provider.reasoningSplitModels ?? []).not.toContain(PREVIEW);
+    expect(route.provider.reasoningDetailsModels ?? []).not.toContain(PREVIEW);
+  });
+
+  test("prior thinking replays as reasoning_content", () => {
+    const route = minimaxRoute(PREVIEW);
+    const request = createOpenAIChatAdapter(route.provider).buildRequest({
+      modelId: route.modelId,
+      context: {
+        messages: [
+          { role: "user", content: "first", timestamp: 0 },
+          {
+            role: "assistant",
+            timestamp: 1,
+            content: [
+              { type: "thinking", thinking: "prior reasoning" },
+              { type: "text", text: "prior answer" },
+            ],
+          },
+          { role: "user", content: "continue", timestamp: 2 },
+        ],
+      },
+      stream: false,
+      options: {},
+    });
+    const sent = JSON.parse(request.body as string) as { messages: Array<Record<string, unknown>> };
+    expect(sent.messages[1]?.reasoning_content).toBe("prior reasoning");
+    expect(sent.messages[1]?.reasoning_details).toBeUndefined();
+  });
+
+  test("streamed reasoning_content deltas surface as reasoning", async () => {
+    const route = minimaxRoute(PREVIEW);
+    const chunks = [
+      { choices: [{ index: 0, delta: { role: "assistant", reasoning_content: "The user" } }] },
+      { choices: [{ index: 0, delta: { reasoning_content: " asks" } }] },
+      { choices: [{ index: 0, delta: { content: "391" } }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+    ];
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const encoder = new TextEncoder();
+        for (const chunk of chunks) controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      },
+    });
+    const events: Array<{ type: string; text?: string }> = [];
+    for await (const event of adapterFor(route.provider, route.modelId).parseStream(new Response(stream), createTranslatorBudget())) {
+      events.push(event);
+    }
+    const reasoning = events.filter(e => e.type === "reasoning_raw_delta").map(e => e.text).join("");
+    expect(reasoning).toBe("The user asks");
+    expect(events.filter(e => e.type === "text_delta").map(e => e.text).join("")).toBe("391");
   });
 });
