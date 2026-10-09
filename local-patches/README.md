@@ -27,6 +27,19 @@ OCX_PATCH_PKG="$PWD" local-patches/ocx-patch
 | 12 | `src/lib/errors.ts` + `src/combos/failover.ts` | 智谱/计划额度上限原文回给 Codex（`usage_limit_exceeded` 进 hop 列表），切模型不再被前一个 provider 的限额粘住 |
 | 13 | `src/providers/registry/entries-core.ts` | xai registry 收录 `grok-4.7`（service tier / Responses wire / 视觉 / prompt cache / 推理档 low–xhigh / 500k 窗口） |
 | 13b | `src/providers/registry/model-seeds.ts` | `XAI_MODELS` 收录 `grok-4.7` |
+| 14 | `src/providers/xai-transport.ts` | Grok CLI 钉定版本跟上 xAI 网关下限（0.2.93 → 1.0.46，上游 #6341/#6343 同款修复）：OAuth 网关 2026-10 起要求 ≥1.0.13，旧值报 426 Upgrade Required |
+
+## 上游状态（2026-10-09）
+
+上游已发布到 **2.81.0**（本分支基线是 2.60.0，中间隔 1299 个提交）。其中与本机直接相关的：
+
+- `#6341` / `#6343` Grok CLI 钉定版本 → 1.0.46（本补丁集的补丁 14 是同款修复）
+- `#6312` xai 只留一个 Grok 4.7 行；OAuth Fast 走 build-fast 车道
+- `#6373` Fast wire 模型跨 API 端点授权
+- `#6482` Grok 会话以 session_id 转发，保持 OpenAI 前缀缓存热度
+- `#6418` Claude Code CLI 第一方 /model 选择器里列出 opencodex 模型
+
+升级到 2.81.0 时需重打全部补丁（锚点可能漂移），并重验 terra/luna/sol/astra 四条路由。
 
 ## 为什么 13/13b 必须改源码
 

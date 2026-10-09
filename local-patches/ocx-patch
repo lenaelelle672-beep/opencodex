@@ -433,5 +433,28 @@ PYEOF
   [ $? -eq 0 ] && ok "补丁13b XAI_MODELS（收录 grok-4.7）已打" || { echo "❌ 补丁13b失败"; exit 1; }
 fi
 
+# ---------- 补丁 14: Grok CLI 钉定版本跟上 xAI 网关下限（0.2.93 → 1.0.46） ----------
+# xAI 的 OAuth 网关（cli-chat-proxy.grok.com）2026-10 起要求客户端版本 ≥1.0.13，
+# 旧钉定 0.2.93 被拒：426 "Your Grok CLI version (0.2.93) is outdated"。
+# 上游 #6341/#6343 已改到 1.0.46；本补丁把同值带进 2.60.0。
+F="$PKG/src/providers/xai-transport.ts"
+if grep -q 'version: "1.0.46"' "$F"; then
+  skip "补丁14 grok-cli 版本（1.0.46）"
+else
+  cp "$F" "$F.bak14"
+  python3 - "$F" << 'PYEOF'
+import re, sys
+f = sys.argv[1]
+s = open(f).read()
+pat = re.compile(
+    r'(export const XAI_GROK_COMPATIBILITY = \{\n  version: ")[^"]+(",\n  userAgent: "opencodex-grok/)[^"]+(")'
+)
+new, n = pat.subn(r'\g<1>1.0.46\g<2>1.0.46\g<3>', s)
+assert n == 1, f"补丁14 锚点匹配 {n} 处（应为1），版本结构变了需手动适配"
+open(f, "w").write(new)
+PYEOF
+  [ $? -eq 0 ] && ok "补丁14 grok-cli 版本（0.2.93→1.0.46）已打" || { echo "❌ 补丁14失败"; exit 1; }
+fi
+
 echo ""
 info "全部补丁就绪。运行 ocxup 重启代理生效。"
