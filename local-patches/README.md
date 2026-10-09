@@ -85,3 +85,17 @@ bun run scripts/test.ts tests/providers/kiro/kiro-stream.test.ts \
 
 > `fork/main` 停留在 2.48.0 那条线（含上面两个 `fix/*`），与上游 2.60.0 没有共同祖先，
 > 所以本补丁集单独走 `local/260-patchset`，没有合进 `main`。
+
+## 运维手册
+
+`opencodex-Codex模型配置指南.md` 是本机日常操作的完整手册（provider 接入、combo 劫持、
+7 行 picker 映射、排错实录）。它从 `~/Desktop/opencodex-Codex模型配置指南.md` 同步而来；
+入库版本把公司内网网关域名替换成了 `<公司网关域名>` 占位符，桌面原件保留真实值。
+
+同步方式（桌面 → 仓库）：
+
+```bash
+sed 's/aibedrock\.uniview\.com/<公司网关域名>/g' \
+  ~/Desktop/opencodex-Codex模型配置指南.md \
+  > local-patches/opencodex-Codex模型配置指南.md
+```
