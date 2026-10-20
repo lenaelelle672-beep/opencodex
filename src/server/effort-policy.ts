@@ -190,6 +190,45 @@ export function applyEffortCap(
 }
 
 /**
+ * Raise a main-turn effort to the routed model's real top rung. Codex GUI may
+ * advertise only xhigh for prefixed models (gs-sol/...) or send a stale global
+ * `low`; adapters already clamp unknown labels, so sending the top supported
+ * rung is the quality-preserving default. Compaction and helper rewrites stay
+ * untouched — those callers force this themselves.
+ */
+export function applyHighestReasoningEffort(
+  parsed: OcxParsedRequest,
+  supported?: readonly string[] | undefined,
+): { from: string; to: string } | null {
+  if (parsed._compactionRequest === true) return null;
+
+  let highest: string | undefined;
+  if (supported === undefined) {
+    highest = "max";
+  } else {
+    const rankable = supported.filter(effort => isCodexReasoningEffort(effort) && effort !== "ultra");
+    if (rankable.length === 0) return null;
+    highest = rankable.reduce((best, rung) => (
+      codexEffortRank(rung) > codexEffortRank(best) ? rung : best
+    ));
+  }
+  if (!highest) return null;
+
+  const requested = parsed.options.reasoning;
+  if (requested === highest) return null;
+  parsed.options.reasoning = highest;
+  const raw = parsed._rawBody as { reasoning?: Record<string, unknown> } | undefined;
+  if (raw && typeof raw === "object") {
+    if (raw.reasoning && typeof raw.reasoning === "object" && !Array.isArray(raw.reasoning)) {
+      raw.reasoning.effort = highest;
+    } else {
+      raw.reasoning = { effort: highest };
+    }
+  }
+  return { from: typeof requested === "string" && requested.length > 0 ? requested : "unset", to: highest };
+}
+
+/**
  * Resolve any pinned reasoning effort configured for this model or provider.
  * Priority order:
  * 1. Provider model-specific pinned effort (`provider.modelPinnedReasoningEfforts[modelId]`)

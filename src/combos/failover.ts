@@ -1,5 +1,5 @@
 import { parseResetCooldownMs } from "../codex/routing";
-import { classifyError, isCyberPolicyCode } from "../lib/errors";
+import { classifyError, isCyberPolicyCode, USAGE_LIMIT_ERROR_CODE } from "../lib/errors";
 import { isNonReplayableUpstreamCode } from "../lib/upstream-retry";
 import { isAnthropicBillingFailure } from "../providers/anthropic-billing-refusal";
 import type { OcxComboTarget } from "../types";
@@ -866,6 +866,7 @@ export function comboFailureDecision(
     "subscription_required",
     "invalid_api_key",
     "insufficient_quota",
+    USAGE_LIMIT_ERROR_CODE,
     "payment_required",
     "billing_error",
     "insufficient_balance",
