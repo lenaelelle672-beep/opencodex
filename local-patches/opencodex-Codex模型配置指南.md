@@ -2,7 +2,7 @@
 
 > 让 Codex（ChatGPT.app 里的 Codex GUI / CLI）使用任意第三方模型：Cursor 账号、xAI 官方、公司网关（gs-deepseek）等。
 > 原理：本地起一个 opencodex 代理，Codex 所有请求先到代理，再由代理翻译转发到各 provider。
-> 当前版本：**opencodex 2.60.0**（2026-09-22 从 2.41.0 升级，10 个本地补丁已重新适配）。
+> 当前版本：**opencodex 2.88.0**（2026-10-20 从 2.60.0 升级，8 个本地补丁重新锚定；13/14/15 已被上游吸收）
 
 ---
 
@@ -127,7 +127,7 @@ ocx combo set terra-native \
 | 智谱 Flash | zhipu-bigmodel-coding/glm-5.3-flash |
 | 公司的GLM5.3Flash | gs-deepseek/glm-5.3-flash（公司网关） |
 | 公司的DeepSeek4.1 | gs-deepseek/deepseek-v4.1-flash（公司网关） |
-| 智谱 5.3（劫持 **gpt-6-astra**） | 先 zhipu-bigmodel-coding/glm-5.3（官方 Coding Plan），撞限额再 cursor/grok-4.7 |
+| 智谱 5.3（劫持 **gpt-6-astra**，窗口 500k） | 先 zhipu-bigmodel-coding/glm-5.3（官方 Coding Plan），撞限额再 cursor/grok-4.7 |
 
 已移除：Cursor 的 sol/luna 原生行、GS-Sol 全系、公司 `glm`/`glm-5.3` 旧条目。官方 OpenAI（gpt-5.5 等）保留在目录里但走 ChatGPT 登录直连，不占 OpenCodex 配额。
 
@@ -256,7 +256,7 @@ echo "模型链路: HTTP $code (200=正常)"
 
 日常：`ocxup` 启动 / `ocxup stop` 停止 / `ocxup restart` 重启。
 
-## 附录 B：本地补丁（2026-10-09 更新，2.60.0 适配，共 11 个）
+## 附录 B：本地补丁（2026-10-20 更新，2.88.0 适配，共 8 个）
 
 以下问题配置层无解，需要改安装包源码（`~/.npm-global/lib/node_modules/@bitkyc08/opencodex/src/`）：
 
@@ -272,7 +272,9 @@ echo "模型链路: HTTP $code (200=正常)"
 | 12 | lib/errors.ts + combos/failover.ts | 智谱/计划额度上限原文回给 Codex（`usage_limit_exceeded` 进 hop 列表），切模型不再被前一个 provider 的限额粘住 |
 | 13 | providers/registry/entries-core.ts | xai registry 收录 grok-4.7（service tier / Responses wire / 视觉 / prompt cache / 推理档 low-xhigh / 500k 窗口）|
 | 13b | providers/registry/model-seeds.ts | `XAI_MODELS` 收录 grok-4.7 |
-| 14 | providers/xai-transport.ts | Grok CLI 钉定版本 0.2.93→1.0.46：xAI OAuth 网关 2026-10 起要求 ≥1.0.13，旧值报 426 Upgrade Required（上游 #6341/#6343 同款） |
+| ~~13/13b~~ xai registry grok-4.7 | **2.88 上游已吸收**（含 grok-4.7-build-fast 快车道），无需再打 |
+| ~~14~~ Grok CLI 钉定版本 | **2.88 上游已吸收**（#6341/#6343，1.0.46） |
+| ~~15~~ cursor grok-4.7 窗口 | **2.88 上游已吸收**（与本地改法一字不差） |
 
 > **为什么 13 必须改源码**：`ocx start` 每次都从 `PROVIDER_REGISTRY` 重新派生 provider 的 `models`、`modelReasoningEfforts`、`modelContextWindows` 等元数据，写进 `config.json` 的 `grok-4.7` 键会在下一次启动被抹掉。抹掉之后 `supportedLadderFor()` 返回 `undefined`，补丁 5 就把回合抬到 `max`，而 xAI 的 grok-4.7 只认 `low/medium/high/xhigh` —— 报 400 `Invalid reasoning effort.`。同理，`grok-4.7` 的能力必须落在 registry 里才稳。
 
@@ -329,3 +331,22 @@ ocx config show          # 全量配置（脱敏）
   提到 1.0.46（与上游一致），修完实测 terra 200 / model=grok-4.7-build / effort=xhigh。
   这个钉定值以后还会过期——再看到 426 且文案提版本号，就是这个原因，照补丁 14 改版本号即可。
 - 同日智谱 Coding Plan 的 7 天限额已恢复（gpt-6-astra 直接回 glm-5.3，不再 hop）。
+
+
+## 附录 F：2.60 → 2.88 升级实录（2026-10-20）
+
+- **版本**：2.60.0 → 2.88.0（npm latest；2.89.0 仅在 GitHub，registry 未上架）。
+- **补丁**：8 个保留（P3/P12 换锚点，P8 重写为接上游新模块 `InlineThinkTagParser`，
+  其余 5 个锚点未漂移）；13/13b、14、15 已被上游吸收，脚本自动跳过。
+- **目录**：新 registry 多出 10 行（gpt-6-sol/luna、gpt-6.1-sol、codex-auto-review、
+  5 个 cursor 新模型、公司网关新发现的 deepseek-v4.1-flash-1017），已加入 disabledModels，
+  picker 维持 7 行。
+- **智谱 5.3 窗口 272k → 500k**：2.60 时代被 cursor/grok-4.7 的 256k 启发式拖低
+  （combo 窗口取成员最小值），上游 2.86 重做窗口推断后自然修复，本地补丁 15 归档。
+- **探针**：7 行全 200（Kimi K3 随 Cursor 配额 10-16 重置恢复）+ 生图桥 200 +
+  P12 冒烟 `使用上限 → usage_limit_exceeded → hop` 通过。
+- **云端**：fork 新增 `local/288-patchset`（基于 v2.88.0）；`local/260-patchset` 留档。
+  大 pack 推送被 GitHub 拒（HTTP 400）时用
+  `git -c http.postBuffer=524288000 push fork <分支>`。
+- **回退**：`npm i -g @bitkyc08/opencodex@2.60.0 && ~/.npm-global/bin/ocx-patch && ~/.npm-global/bin/ocxup start`
+  （注意回退后 15 个补丁的脚本仍兼容：13/14/15 会重新打上）。
