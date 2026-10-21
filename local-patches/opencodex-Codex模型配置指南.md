@@ -121,15 +121,13 @@ ocx combo set terra-native \
 
 | GUI 里显示 | 实际走的 |
 |---|---|
-| Cursor Grok 4.7（劫持 gpt-5.6-luna） | cursor/grok-4.7 |
-| Cursor Kimi K3（劫持 gpt-5.6-sol） | cursor/kimi-k3 |
 | xAI Grok 4.7 (官方直连)（劫持 gpt-5.6-terra） | xai/grok-4.7 |
 | 智谱 Flash | zhipu-bigmodel-coding/glm-5.3-flash |
 | 公司的GLM5.3Flash | gs-deepseek/glm-5.3-flash（公司网关） |
 | 公司的DeepSeek4.1 | gs-deepseek/deepseek-v4.1-flash（公司网关） |
-| 智谱 5.3（劫持 **gpt-6-astra**，窗口 500k） | 先 zhipu-bigmodel-coding/glm-5.3（官方 Coding Plan），撞限额再 cursor/grok-4.7 |
+| 智谱 5.3（劫持 **gpt-6-astra**，窗口 500k） | 先 zhipu-bigmodel-coding/glm-5.3（官方 Coding Plan），撞限额再 xai/grok-4.7 |
 
-已移除：Cursor 的 sol/luna 原生行、GS-Sol 全系、公司 `glm`/`glm-5.3` 旧条目。官方 OpenAI（gpt-5.5 等）保留在目录里但走 ChatGPT 登录直连，不占 OpenCodex 配额。
+已移除：GS-Sol 全系、公司 `glm`/`glm-5.3` 旧条目，以及**整个 Cursor provider**（2026-10-21：OAuth 会话一个月内两度被吊销，弃用）。官方 OpenAI（gpt-5.5 等）保留在目录里但走 ChatGPT 登录直连，不占 OpenCodex 配额。
 
 带 `/` 的路由行（如 `zhipu-bigmodel-coding/glm-5.3`、`xai/grok-4.7`）会和上面的 nativeAlias **重复出现**。官方入口只留原生别名，重复路由行用 `ocx models disable <provider>/<model>` 藏掉，不要 disable `gpt-6-astra`。
 
@@ -350,3 +348,17 @@ ocx config show          # 全量配置（脱敏）
   `git -c http.postBuffer=524288000 push fork <分支>`。
 - **回退**：`npm i -g @bitkyc08/opencodex@2.60.0 && ~/.npm-global/bin/ocx-patch && ~/.npm-global/bin/ocxup start`
   （注意回退后 15 个补丁的脚本仍兼容：13/14/15 会重新打上）。
+
+
+## 附录 G：移除 Cursor（2026-10-21）
+
+Cursor OAuth 会话一个月内两度被吊销（xAI 也死过一次），第二次 refresh token 直接失效，
+`ocx login cursor` 也只是续命。决定整体弃用：
+
+- 删 `providers.cursor`、删 `cursor-grok47-native`（gpt-5.6-luna）与 `k3-native`（gpt-5.6-sol）两个 combo；
+- 智谱 5.3（gpt-6-astra）的 failover 备胎 cursor/grok-4.7 → **xai/grok-4.7**（同一底层模型，官方直连）；
+- visionSidecar 从 gpt-5.6-luna 改指 gpt-5.6-terra；
+- `ocxup` 次检从 Cursor 车道换成智谱链路（gpt-6-astra）。
+- picker 7 行 → **5 行**，全量探针 200。auth.json 里的 Cursor 凭证未删（想彻底清就 `ocx logout cursor`）。
+- 若日后想恢复：`ocx login cursor` + 把两个 combo 加回来即可，配置备份在
+  `config.json.bak-no-cursor-20261021-*`。
