@@ -125,6 +125,7 @@ ocx combo set terra-native \
 | 智谱 Flash | zhipu-bigmodel-coding/glm-5.3-flash |
 | 公司的GLM5.3Flash | gs-deepseek/glm-5.3-flash（公司网关） |
 | 公司的DeepSeek4.1 | gs-deepseek/deepseek-v4.1-flash（公司网关） |
+| 公司的DeepSeek1017 | gs-deepseek/deepseek-v4.1-flash-1017（公司网关，2026-10-21 新增，与 4.1 并存） |
 | 智谱 5.3（劫持 **gpt-6-astra**，窗口 500k） | 先 zhipu-bigmodel-coding/glm-5.3（官方 Coding Plan），撞限额再 xai/grok-4.7 |
 
 已移除：GS-Sol 全系、公司 `glm`/`glm-5.3` 旧条目，以及**整个 Cursor provider**（2026-10-21：OAuth 会话一个月内两度被吊销，弃用）。官方 OpenAI（gpt-5.5 等）保留在目录里但走 ChatGPT 登录直连，不占 OpenCodex 配额。
