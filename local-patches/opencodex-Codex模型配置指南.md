@@ -123,9 +123,9 @@ ocx combo set terra-native \
 |---|---|
 | xAI Grok 4.7 (官方直连)（劫持 gpt-5.6-terra） | xai/grok-4.7 |
 | 智谱 Flash | zhipu-bigmodel-coding/glm-5.3-flash |
-| 公司的GLM5.3Flash | gs-deepseek/glm-5.3-flash（公司网关） |
-| 公司的DeepSeek4.1 | gs-deepseek/deepseek-v4.1-flash（公司网关） |
-| 公司的DeepSeek1017 | gs-deepseek/deepseek-v4.1-flash-1017（公司网关，2026-10-21 新增，与 4.1 并存） |
+| 公司的GLM5.3Flash | gs-deepseek/glm-5.3-flash（旧 key，小写 id） |
+| 公司的DeepSeek4.1 | gs-deepseek/deepseek-v4.1-flash（旧 key，小写 id） |
+| 公司的DeepSeekV4Flash | gs-deepseek-v4/DeepSeek-V4-Flash（新 key，大写 id） |
 | 智谱 5.3（劫持 **gpt-6-astra**，窗口 500k） | 先 zhipu-bigmodel-coding/glm-5.3（官方 Coding Plan），撞限额再 xai/grok-4.7 |
 
 已移除：GS-Sol 全系、公司 `glm`/`glm-5.3` 旧条目，以及**整个 Cursor provider**（2026-10-21：OAuth 会话一个月内两度被吊销，弃用）。官方 OpenAI（gpt-5.5 等）保留在目录里但走 ChatGPT 登录直连，不占 OpenCodex 配额。
@@ -363,3 +363,24 @@ Cursor OAuth 会话一个月内两度被吊销（xAI 也死过一次），第二
 - picker 7 行 → **5 行**，全量探针 200。auth.json 里的 Cursor 凭证未删（想彻底清就 `ocx logout cursor`）。
 - 若日后想恢复：`ocx login cursor` + 把两个 combo 加回来即可，配置备份在
   `config.json.bak-no-cursor-20261021-*`。
+
+
+## 附录 H：两把公司网关 key 的整合（2026-10-30）
+
+公司网关的两把 key 服务**不同的模型命名空间**，不能混用：
+
+| key | 能调的模型 id |
+|---|---|
+| 旧 `sk-glQ…`（id `4a83779f`） | 小写：`glm-5.3-flash`、`deepseek-v4.1-flash`、`deepseek-v4.1-flash-1017` |
+| 新 `sk-SPs…`（id `52d61ac3`） | 大写：`DeepSeek-V4-Flash`、`DeepSeek-V4.1-Flash` |
+
+大写/小写互不兼容（实测：新 key 调小写全 503 `model_not_found`，旧 key 调大写同样 503）。
+OpenCodex 的 key 池**不支持按模型选 key**（池只做故障轮换），所以混在一个 provider 里
+必然有一半模型 503。整合方式 = **按 key 拆成两个 provider**：
+
+- `gs-deepseek`：旧 key + 小写 id（`glm-5.3-flash`、`deepseek-v4.1-flash`）
+- `gs-deepseek-v4`：新 key + 大写 id（`DeepSeek-V4-Flash`、`DeepSeek-V4.1-Flash`）
+
+两条 provider 各自单 key、无池，请求不会再串到错的 key 上。四条路由实测全 200。
+面板上的 `deepseek-v4.1-flash-1017` 已下线（它和 `DeepSeek-V4.1-Flash` 是同一个
+`DeepSeek-V4.1-Flash-1017` 部署，只是两个 key 的命名空间不同），保留大写那条即可。
