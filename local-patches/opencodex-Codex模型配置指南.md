@@ -125,7 +125,6 @@ ocx combo set terra-native \
 | 智谱 Flash | zhipu-bigmodel-coding/glm-5.3-flash |
 | 公司的GLM5.3Flash | **ai-glm53-flash**（combo → gs-deepseek/glm-5.3-flash，旧 key） |
 | 公司的DeepSeek4.1 | **ai-deepseek41**（combo → 先旧 key 小写，挂了大写，同一部署） |
-| 公司的DeepSeekV4Flash | **ai-deepseek-v4**（combo → gs-deepseek-v4/DeepSeek-V4-Flash，新 key） |
 
 已移除：GS-Sol 全系、公司 `glm`/`glm-5.3` 旧条目，以及**整个 Cursor provider**（2026-10-21：OAuth 会话一个月内两度被吊销，弃用）。官方 OpenAI（gpt-5.5 等）保留在目录里但走 ChatGPT 登录直连，不占 OpenCodex 配额。
 
@@ -393,7 +392,6 @@ OpenCodex 的 key 池**不支持按模型选 key**（池只做故障轮换），
 |---|---|
 | `ai-glm53-flash` | gs-deepseek/glm-5.3-flash（旧 key） |
 | `ai-deepseek41` | 先 gs-deepseek/deepseek-v4.1-flash（旧 key），失败 hop 到 gs-deepseek-v4/DeepSeek-V4.1-Flash（新 key）——同一部署的两个命名空间，等价互备 |
-| `ai-deepseek-v4` | gs-deepseek-v4/DeepSeek-V4-Flash（新 key） |
 
 要点：
 
@@ -402,3 +400,15 @@ OpenCodex 的 key 池**不支持按模型选 key**（池只做故障轮换），
 - 这样 ZCode 只需配一个 provider（`http://127.0.0.1:10100/v1`），模型填上面三个名字即可；
   两把 key 的差别完全被 combo 吃掉。
 - 新增公司模型时：先在对应 provider 的 `models` 里登记，再加一个 combo 别名，最后隐藏裸行。
+
+
+## 附录 J：DeepSeek 全部对齐 V4.1（2026-10-30）
+
+核实发现新 key 上的 `DeepSeek-V4-Flash`（网关回显 `DeepSeek-V4-Flash-0731`）是 **V4 老模型**，
+不是 V4.1，已整体下线（combo 与 provider 模型都删，裸行隐藏）。判定依据是网关回显的 model 字段
+（模型自述不可信，同一个 V4.1 会自称 V3.2）。现在公司 DeepSeek 只剩一条 `ai-deepseek41`：
+
+- 主目标：旧 key `deepseek-v4.1-flash`（回显同名，V4.1）
+- 备胎：新 key `DeepSeek-V4.1-Flash`（回显 `DeepSeek-V4.1-Flash-1017`，V4.1 的 1017 构建）
+
+两条都是 V4.1， Responses / chat-completions 双通道 200。picker 收敛到 5 行。
