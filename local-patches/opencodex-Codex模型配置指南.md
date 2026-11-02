@@ -269,6 +269,7 @@ echo "模型链路: HTTP $code (200=正常)"
 | 12 | lib/errors.ts + combos/failover.ts | 智谱/计划额度上限原文回给 Codex（`usage_limit_exceeded` 进 hop 列表），切模型不再被前一个 provider 的限额粘住 |
 | 13 | providers/registry/entries-core.ts | xai registry 收录 grok-4.7（service tier / Responses wire / 视觉 / prompt cache / 推理档 low-xhigh / 500k 窗口）|
 | 13b | providers/registry/model-seeds.ts | `XAI_MODELS` 收录 grok-4.7 |
+| 16 | adapters/openai-responses/request-strips.ts + passthrough.ts | 剥掉 include 里的 `output.encrypted_content`（仅 xAI/Meta/Azure 目标）：Codex 新版每轮都发，xAI 校验 schema 直接 400 `Argument not supported`，grok-4.7 整条路由不可用 |
 | ~~13/13b~~ xai registry grok-4.7 | **2.88 上游已吸收**（含 grok-4.7-build-fast 快车道），无需再打 |
 | ~~14~~ Grok CLI 钉定版本 | **2.88 上游已吸收**（#6341/#6343，1.0.46） |
 | ~~15~~ cursor grok-4.7 窗口 | **2.88 上游已吸收**（与本地改法一字不差） |
@@ -412,3 +413,23 @@ OpenCodex 的 key 池**不支持按模型选 key**（池只做故障轮换），
 - 备胎：新 key `DeepSeek-V4.1-Flash`（回显 `DeepSeek-V4.1-Flash-1017`，V4.1 的 1017 构建）
 
 两条都是 V4.1， Responses / chat-completions 双通道 200。picker 收敛到 5 行。
+
+
+## 附录 K：Codex 新版 + xAI 的 include 400（2026-11-02）
+
+**现象**：`gpt-5.6-terra`（xAI Grok 4.7 官方直连）全部报
+
+```
+Provider error 400: {"error":"Argument not supported: "output.encrypted_content" in "include" field"}
+```
+
+**根因**：Codex 客户端（ChatGPT.app 26.1027 起）在 Responses 请求的 `include` 里带
+`output.encrypted_content`。这是 ChatGPT 后端私有项，公开规范没有；xAI 的 Responses
+端点会先校验 schema，见到未知 include 就整请求 400。**与账号余额无关**（代理侧裸探针
+不带该字段时 terra 一直是 200），也不是我们配置错。
+
+**修法（补丁 16，与上游同款）**：新增 `stripUnsupportedOutputInclude()`，只在目标是
+xAI / Meta / Azure 时剥离 `output.encrypted_content`，保留 `reasoning.encrypted_content`
+（无状态回放要用）。修完：非流式、流式（Codex 实际用法）、以及其余 4 行回归全部 200。
+**注意这个坑会随客户端升级再出现**——以后再看到 `Argument not supported: "..." in "include" field`，
+就是这个模式：客户端加了新字段，上游校验拒绝。
