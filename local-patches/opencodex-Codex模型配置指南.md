@@ -2,7 +2,7 @@
 
 > 让 Codex（ChatGPT.app 里的 Codex GUI / CLI）使用任意第三方模型：Cursor 账号、xAI 官方、公司网关（gs-deepseek）等。
 > 原理：本地起一个 opencodex 代理，Codex 所有请求先到代理，再由代理翻译转发到各 provider。
-> 当前版本：**opencodex 2.88.0**（2026-10-20 从 2.60.0 升级，8 个本地补丁重新锚定；13/14/15 已被上游吸收）
+> 当前版本：**opencodex 2.97.0**（2026-11-04 从 2.88.0 升级，8 个本地补丁锚点未漂移；13/13b/14/15/16 已被上游吸收）
 
 ---
 
@@ -253,7 +253,7 @@ echo "模型链路: HTTP $code (200=正常)"
 
 日常：`ocxup` 启动 / `ocxup stop` 停止 / `ocxup restart` 重启。
 
-## 附录 B：本地补丁（2026-10-20 更新，2.88.0 适配，共 8 个）
+## 附录 B：本地补丁（2026-11-04 更新，2.97.0 适配，共 8 个）
 
 以下问题配置层无解，需要改安装包源码（`~/.npm-global/lib/node_modules/@bitkyc08/opencodex/src/`）：
 
@@ -269,7 +269,7 @@ echo "模型链路: HTTP $code (200=正常)"
 | 12 | lib/errors.ts + combos/failover.ts | 智谱/计划额度上限原文回给 Codex（`usage_limit_exceeded` 进 hop 列表），切模型不再被前一个 provider 的限额粘住 |
 | 13 | providers/registry/entries-core.ts | xai registry 收录 grok-4.7（service tier / Responses wire / 视觉 / prompt cache / 推理档 low-xhigh / 500k 窗口）|
 | 13b | providers/registry/model-seeds.ts | `XAI_MODELS` 收录 grok-4.7 |
-| 16 | adapters/openai-responses/request-strips.ts + passthrough.ts | 剥掉 include 里的 `output.encrypted_content`（仅 xAI/Meta/Azure 目标）：Codex 新版每轮都发，xAI 校验 schema 直接 400 `Argument not supported`，grok-4.7 整条路由不可用 |
+| ~~16~~ include 剥离 | **2.97 上游已吸收**（`stripUnsupportedOutputInclude`），无需再打 |
 | ~~13/13b~~ xai registry grok-4.7 | **2.88 上游已吸收**（含 grok-4.7-build-fast 快车道），无需再打 |
 | ~~14~~ Grok CLI 钉定版本 | **2.88 上游已吸收**（#6341/#6343，1.0.46） |
 | ~~15~~ cursor grok-4.7 窗口 | **2.88 上游已吸收**（与本地改法一字不差） |
@@ -433,3 +433,15 @@ xAI / Meta / Azure 时剥离 `output.encrypted_content`，保留 `reasoning.encr
 （无状态回放要用）。修完：非流式、流式（Codex 实际用法）、以及其余 4 行回归全部 200。
 **注意这个坑会随客户端升级再出现**——以后再看到 `Argument not supported: "..." in "include" field`，
 就是这个模式：客户端加了新字段，上游校验拒绝。
+
+
+## 附录 L：2.88 → 2.97 升级实录（2026-11-04）
+
+- **补丁**：8 个保留补丁（3/4/5/8/9/10/11/12）**锚点全部未漂移**，脚本一次通过。上游又把 4 项吸收了：
+  grok-4.7 registry 能力、Grok CLI 1.0.46、cursor grok-4.7 500k 窗口、`output.encrypted_content` 剥离（补丁 16）。
+- **目录**：新 registry 多出 3 行（`gpt-6.1-terra`、`glm-5.3-flashx-legal`、`codex-auto-review`），已隐藏，picker 维持 5 行。
+- **探针**：带 Codex 实际发送的 `include` 字段实测，terra / 智谱 5.3 / 公司两行全 200；生图桥 200。
+- **配额**：智谱 Flash 撞的是 **7 天**限额（不是 5 小时），单目标无备胎，等重置；智谱 5.3 撞限会 hop 到 xai。
+- **云端**：fork 新增 `local/297-patchset`（基于 v2.97.0），2.88/2.60 分支留档。
+- **回退**：`npm i -g @bitkyc08/opencodex@2.88.0 && ~/.npm-global/bin/ocx-patch && ~/.npm-global/bin/ocxup start`
+  （脚本向下兼容，回退后 13/14/15/16 会重新打上）。
