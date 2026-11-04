@@ -35,6 +35,7 @@ import { buildNonOpenAIToolCatalogNudgeForTools } from "./tool-catalog-nudge";
 import { decodeServerSentEvents } from "../lib/sse-decoder";
 import { isLikelyRealAnthropicThinkingSignature } from "../responses/reasoning-envelope";
 import { isTranslatorBudgetExceededError, retainTranslatedEventBatch, type TranslatorBudget } from "../lib/translator-budget";
+import { InlineThinkTagParser } from "./inline-think-tags";
 import { isReasoningEffortOmitted, modelRecordValue } from "../reasoning-effort";
 import { resolveThinkingEnabled } from "../clients/reasoning-controls";
 import { resolveReasoningCapabilities } from "../providers/reasoning-capabilities";
@@ -1319,6 +1320,19 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
       let pendingStopReason: string | undefined;
       let emittedDone = false;
       let sawVisibleText = false;
+      // Anthropic-compatible gateways may serialize reasoning as a leading literal tag
+      // inside ordinary text blocks instead of emitting structured thinking deltas.
+      const taggedThinking = new InlineThinkTagParser(budget);
+      const parseOrdinaryText = (text: string): AdapterEvent[] => {
+        const events = taggedThinking.feed(text);
+        if (events.some(event => event.type === "text_delta" && event.text.length > 0)) sawVisibleText = true;
+        return events;
+      };
+      const flushOrdinaryText = (): AdapterEvent[] => {
+        const events = taggedThinking.flush();
+        if (events.some(event => event.type === "text_delta" && event.text.length > 0)) sawVisibleText = true;
+        return events;
+      };
       /** The open server-side web_search / web_fetch call, until its result block. */
       let serverSearch: { id: string; json: string; streaming: boolean } | undefined;
 
@@ -1452,11 +1466,9 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
                 const delta = data.delta as Record<string, unknown> | undefined;
                 if (!delta) break;
                 if (delta.type === "text_delta" && typeof delta.text === "string") {
-                  // Only non-empty text proves the upstream produced usable output; an empty
-                  // delta followed by EOF must stay a truncation error even on the tolerant
-                  // profile, or a cut-off turn would surface as a successful empty answer.
-                  if (delta.text.length > 0) sawVisibleText = true;
-                  yield { type: "text_delta", text: delta.text };
+                  // Visibility is determined after literal thinking tags are classified. Tagged
+                  // reasoning must not make a reasoning-only tolerant-EOF response look complete.
+                  for (const event of parseOrdinaryText(delta.text)) yield event;
                 } else if (delta.type === "thinking_delta" && typeof delta.thinking === "string") {
                   yield { type: "thinking_delta", thinking: delta.thinking };
                 } else if (delta.type === "reasoning_delta" && typeof delta.reasoning === "string") {
@@ -1494,6 +1506,9 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
               }
               case "content_block_stop": {
                 if (serverSearch) serverSearch.streaming = false;
+                if (currentBlockType === "text") {
+                  for (const event of flushOrdinaryText()) yield event;
+                }
                 if (currentBlockType === "tool_use") {
                   // The non-stream path repairs an unparseable payload in toolUseArguments(); the
                   // stream cannot, because the fragments are already downstream. Fail the turn
@@ -1525,6 +1540,7 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
                 break;
               }
               case "message_stop": {
+                for (const event of flushOrdinaryText()) yield event;
                 yield* emitDone();
                 return;
               }
@@ -1564,6 +1580,7 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
         if (currentToolCallId) budget.closeCall(currentToolCallId);
       }
       if (!emittedDone) {
+        for (const event of flushOrdinaryText()) yield event;
         // Fail closed on transport EOF. Compatible providers may omit message_stop after message_delta.stop_reason.
         if (pendingStopReason !== undefined) {
           // Same rule as emitDone: an `error` stop reason is a failed generation, not a stop.
@@ -1644,6 +1661,7 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
       budget.chargeRetained(responseBytes, { kind: "retained_collectors" });
       try {
       const events: AdapterEvent[] = [];
+      const taggedThinking = new InlineThinkTagParser(budget);
       // Same retain-then-return tail every other terminal branch in this function uses; naming it
       // keeps the two shape guards below from drifting out of step with the accounting.
       const finishWithEvents = (batch: AdapterEvent[]): AdapterEvent[] => {
@@ -1678,7 +1696,7 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
       if (content) {
         for (const block of content) {
           if (block.type === "text" && block.text) {
-            events.push({ type: "text_delta", text: block.text });
+            events.push(...taggedThinking.feed(block.text), ...taggedThinking.flush());
           } else if (block.type === "thinking" && typeof block.thinking === "string") {
             events.push({ type: "thinking_delta", thinking: block.thinking });
             if (typeof block.signature === "string" && block.signature) {

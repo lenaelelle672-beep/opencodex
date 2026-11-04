@@ -375,6 +375,22 @@ export async function applyFinalRouteRequestNormalization(args: {
   }
 
   {
+    const { applyHighestReasoningEffort, supportedLadderFor } = await import("../effort-policy");
+    if (
+      parsed._compactionRequest !== true
+      && (logCtx as unknown as Record<string, unknown>).shadowCallRewrittenFrom === undefined
+    ) {
+      const raised = applyHighestReasoningEffort(parsed, supportedLadderFor(route));
+      if (raised) {
+        logCtx.requestedEffort = `${raised.from}->${raised.to}`;
+        if (isInjectionDebugEnabled()) {
+          injectionDebugLog(`[opencodex] ${route.modelId}: effort raised to model top (${raised.from} -> ${raised.to})`);
+        }
+      }
+    }
+  }
+
+  {
     const raw = parsed._rawBody as { reasoning?: { effort?: string } } | undefined;
     // The parser folds `ultra` to `max` only in options.reasoning; the passthrough adapter
     // serializes the raw body, so a raw `ultra` must reach the clamp itself (#7590).

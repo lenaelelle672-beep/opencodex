@@ -49,7 +49,9 @@ export function isRetryableCursorError(err: unknown): boolean {
   const message = err instanceof Error ? err.message : typeof err === "string" ? err : "";
   const haystack = `${code} ${message}`.toLowerCase();
   if (/auth|unauthor|forbidden|invalid|permission|denied|not found|unsupported/.test(haystack)) return false;
-  if (/resource.exhausted|resource_exhausted|rate limit|too many requests|throttl/.test(haystack)) return false;
+  // Rate-limit rejections happen BEFORE the run is committed — safe to retry with backoff.
+  // (Previously non-retryable, which surfaced per-minute throttling straight to Codex.)
+  if (/resource.exhausted|resource_exhausted|rate limit|too many requests|throttl/.test(haystack)) return true;
   if (haystack.includes("nghttp2_cancel") || haystack.includes("stream suspended")) return false;
   return (
     haystack.includes("econnreset") ||
