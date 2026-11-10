@@ -445,3 +445,30 @@ xAI / Meta / Azure 时剥离 `output.encrypted_content`，保留 `reasoning.encr
 - **云端**：fork 新增 `local/297-patchset`（基于 v2.97.0），2.88/2.60 分支留档。
 - **回退**：`npm i -g @bitkyc08/opencodex@2.88.0 && ~/.npm-global/bin/ocx-patch && ~/.npm-global/bin/ocxup start`
   （脚本向下兼容，回退后 13/14/15/16 会重新打上）。
+
+
+## 附录 M：重复智谱行清理 + xAI 原生别名恢复（2026-11-10）
+
+**现象**：Codex picker 同时出现「智谱 5.3」和「glm-5.3」两行。逐字比对两条 combo
+（zhipu-glm53-native / glm53-fallback）定义完全一致——同 targets、同策略，是纯重复。
+11-09 的一批改动新增了 glm53-fallback（alias 裸名 glm-5.3），即多出的那行。
+
+**处理**：裸名 `glm-5.3` 加进 disabledModels（只影响 picker 可见性，该 id 仍可路由，
+实测隐藏后 200）。picker 回到 5 行。
+
+**同批修复**：
+
+- **恢复 terra-native**：`gpt-5.6-terra` → xai/grok-4.7（显示名「xAI Grok 4.7 (官方直连)」），
+  裸行 `xai/grok-4.7` 隐藏。恢复前该 slug 落到 Codex 主账号（429 主账号配额保护），
+  恢复后 200 → grok-4.7-build。
+- **删除 grok47-redirect 空壳**：alias=None 且目标写成自身 slug，必然 503，无消费者。
+- **ZCode 模型清单清理**：原来 8 项里 4 项失效（cursor/grok-4.7、cursor/kimi-k3、
+  deepseek-v4.1-flash-1017、ai-deepseek41——后两者 combo 已删但 ZCode 还在引用，503）。
+  改为 6 项全部实测存活：gpt-6-astra、zhipu-bigmodel-coding/glm-5.3、
+  zhipu-bigmodel-coding/glm-5.3-flash、ai-glm53-flash、gs-deepseek/deepseek-v4.1-flash、
+  gpt-5.6-terra。chat-completions 通道逐项 200。
+
+**教训（已进记忆）**：改 combo 前先 grep 两个消费端——ZCode 的
+`~/.zcode/v2/provider_config.json` 和 Codex 的原生别名。删 combo 会让 ZCode 的引用
+落到 defaultProvider 并把 combo 名当模型 id 发给网关（503 model_not_found），错误信息
+里出现 combo 名即是此症。
